@@ -1,0 +1,6 @@
+models/
+model/
+venv/
+*.safetensors
+*.bin
+.env
