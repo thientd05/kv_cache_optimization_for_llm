@@ -1,67 +1,22 @@
-#include "cuda_to_hip.h"
 #include "kernels.cuh"
-#include <iostream>
+#include <cmath>
 #include <vector>
 
-// TODO perhaps share these between main.cpp and kernels.cu to not duplicate them?
+float *d_cos_table = nullptr; // [MAX_SEQ_LEN, HEAD_DIM]
+float *d_sin_table = nullptr; // [MAX_SEQ_LEN, HEAD_DIM]
 
-constexpr int N_LAYERS = 16; // TODO: hardcoded for llama 3.2 1B, just like any other value for now
-constexpr int EMBEDDING_LENGTH = 2048;
-constexpr int KV_DIM = 512;
-constexpr int HEAD_DIM = 64;
-constexpr float SQRT_HEAD_DIM = 8;
-constexpr int NUM_Q_HEADS = 32;
-constexpr int GQA_Q_TO_K_RATIO = 4;
-constexpr int MAX_SEQ_LEN = 2048; // TODO: make it tunable
-constexpr int BLOCK_SIZE = 16;    // TODO: tunable as well, defined the size of a single page in pagedattn
-constexpr int V_OFFSET = BLOCK_SIZE * KV_DIM * sizeof(__nv_bfloat16);
-constexpr int BLOCK_BYTES = V_OFFSET * 2;                    // * 2 because K and V
-constexpr int MAX_BLOCKS_PER_SEQ = MAX_SEQ_LEN / BLOCK_SIZE; // 2048 / 16 = 128
-
-
-float *d_inv_freq = nullptr; 
-float *d_cos_table = nullptr; // [max_seq_len, head_dim]
-float *d_sin_table = nullptr; // [max_seq_len, head_dim]
-
-// prefill / shared
-
-// gpu_input_tokens - N tokens
-// gpu_input_embeds - N * sizeof(__nv_bfloat16) * 2048
-// embed_tokens - (100000+smth, 2048)
-// num_input_tokens - N (just N, not N tokens)
-__global__ void embeddingGatherKernel(int *gpu_input_tokens, __nv_bfloat16 *gpu_input_embeds, __nv_bfloat16 *embed_tokens, int num_input_tokens)
-{
-    int workIndex = threadIdx.x + blockIdx.x * 2048;
-    if (workIndex < num_input_tokens * 2048)
-    {
-        gpu_input_embeds[workIndex] = embed_tokens[gpu_input_tokens[blockIdx.x] * 2048 + threadIdx.x];
-        gpu_input_embeds[workIndex + 1024] = embed_tokens[gpu_input_tokens[blockIdx.x] * 2048 + threadIdx.x + 1024];
-    }
-}
-
-void embeddingGather(int *gpu_input_tokens, __nv_bfloat16 *gpu_input_embeds, __nv_bfloat16 *embed_tokens, int num_input_tokens)
-{
-    // even though embedding is 2048, I can only dispatch 1024 because it's max threads per block on my gpu
-    embeddingGatherKernel<<<num_input_tokens, 1024>>>(gpu_input_tokens, gpu_input_embeds, embed_tokens, num_input_tokens);
-#ifdef DEBUG
-    cudaError error = cudaGetLastError();
-    if (error != cudaError::cudaSuccess)
-    {
-        std::cout << "CUDA last error: " << cudaGetLastError() << std::endl;
-    }
-#endif
-}
+// ---- shared by prefill and decode ----
 
 __global__ void rmsNormKernel(__nv_bfloat16 *input, __nv_bfloat16 *output, __nv_bfloat16 *norm_weights, int num_tokens)
 {
-    __shared__ float rms_vector[1024];
-    int workIndex = threadIdx.x + blockIdx.x * 2048;
-    if (workIndex < num_tokens * 2048)
+    __shared__ float rms_vector[EMBED_HALF];
+    int workIndex = threadIdx.x + blockIdx.x * EMBEDDING_LENGTH;
+    if (workIndex < num_tokens * EMBEDDING_LENGTH)
     {
-        rms_vector[threadIdx.x] = (float)input[workIndex] * (float)input[workIndex] + (float)input[workIndex + 1024] * (float)input[workIndex + 1024];
+        rms_vector[threadIdx.x] = (float)input[workIndex] * (float)input[workIndex] + (float)input[workIndex + EMBED_HALF] * (float)input[workIndex + EMBED_HALF];
         __syncthreads();
         // tree reduction
-        for (int i = 1; i < 1024; i = i * 2)
+        for (int i = 1; i < EMBED_HALF; i = i * 2)
         {
             if (threadIdx.x % (i * 2) == 0)
             {
@@ -71,40 +26,43 @@ __global__ void rmsNormKernel(__nv_bfloat16 *input, __nv_bfloat16 *output, __nv_
         }
         if (threadIdx.x == 0)
         {
-            rms_vector[0] = sqrt(rms_vector[0] / 2048.0 + 1.0e-5);
+            rms_vector[0] = sqrt(rms_vector[0] / (double)EMBEDDING_LENGTH + RMS_NORM_EPS);
         }
         __syncthreads();
         // <(^-^)>
         output[workIndex] = (__nv_bfloat16)(((float)input[workIndex] / rms_vector[0]) * (float)norm_weights[threadIdx.x]);
-        output[workIndex + 1024] = (__nv_bfloat16)(((float)input[workIndex + 1024] / rms_vector[0]) * (float)norm_weights[threadIdx.x + 1024]);
+        output[workIndex + EMBED_HALF] = (__nv_bfloat16)(((float)input[workIndex + EMBED_HALF] / rms_vector[0]) * (float)norm_weights[threadIdx.x + EMBED_HALF]);
     }
 }
 
-// (N, 2048) -> (N, 2048)
-void rmsNorm(__nv_bfloat16 *input, __nv_bfloat16 *output, __nv_bfloat16 *norm_weights, int num_tokens)
+__global__ void residualKernel(__nv_bfloat16 *input, __nv_bfloat16 *input_embeds)
 {
-    rmsNormKernel<<<num_tokens, 1024>>>(input, output, norm_weights, num_tokens);
-#ifdef DEBUG
-    cudaError error = cudaGetLastError();
-    if (error != cudaError::cudaSuccess)
+    int workIndex = threadIdx.x + blockIdx.x * EMBEDDING_LENGTH;
+    input[workIndex] = input[workIndex] + input_embeds[workIndex];
+    input[workIndex + EMBED_HALF] = input[workIndex + EMBED_HALF] + input_embeds[workIndex + EMBED_HALF];
+}
+
+__global__ void siluKernel(__nv_bfloat16 *a, __nv_bfloat16 *b)
+{
+    int workIndex = threadIdx.x + blockIdx.x * HIDDEN_DIM;
+    for (int i = 0; i < HIDDEN_DIM; i += MAX_THREADS_PER_BLOCK)
     {
-        std::cout << "CUDA last error: " << cudaGetLastError() << std::endl;
+        a[workIndex + i] = (__nv_bfloat16)((float)a[workIndex + i] * (1 / (1 + expf(-(float)a[workIndex + i]))) * (float)b[workIndex + i]);
     }
-#endif
 }
 
-void init_rope_frequencies(int head_dim, int max_seq_len, float rope_theta,
-                           float factor, float low_freq_factor,
-                           float high_freq_factor, int original_max_len)
+// ---- RoPE tables ----
+
+void initRopeFrequencies()
 {
-    int half_dim = head_dim / 2;
+    constexpr int half_dim = HEAD_DIM / 2;
     std::vector<float> inv_freq(half_dim);
     for (int i = 0; i < half_dim; i++)
     {
-        inv_freq[i] = 1.0f / std::pow(rope_theta, (2.0f * i) / head_dim);
+        inv_freq[i] = 1.0f / std::pow(ROPE_THETA, (2.0f * i) / HEAD_DIM);
     }
-    float low_freq_wavelen = (float)original_max_len / low_freq_factor;
-    float high_freq_wavelen = (float)original_max_len / high_freq_factor;
+    float low_freq_wavelen = (float)ROPE_ORIGINAL_MAX_LEN / ROPE_LOW_FREQ_FACTOR;
+    float high_freq_wavelen = (float)ROPE_ORIGINAL_MAX_LEN / ROPE_HIGH_FREQ_FACTOR;
 
     std::vector<float> inv_freq_llama = inv_freq;
 
@@ -114,269 +72,58 @@ void init_rope_frequencies(int head_dim, int max_seq_len, float rope_theta,
 
         if (wavelen > low_freq_wavelen)
         {
-            inv_freq_llama[i] = inv_freq[i] / factor;
+            inv_freq_llama[i] = inv_freq[i] / ROPE_SCALING_FACTOR;
         }
         else if (wavelen >= high_freq_wavelen)
         {
-            float smooth = ((float)original_max_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor);
-            inv_freq_llama[i] = (1.0f - smooth) * (inv_freq[i] / factor) + smooth * inv_freq[i];
+            float smooth = ((float)ROPE_ORIGINAL_MAX_LEN / wavelen - ROPE_LOW_FREQ_FACTOR) / (ROPE_HIGH_FREQ_FACTOR - ROPE_LOW_FREQ_FACTOR);
+            inv_freq_llama[i] = (1.0f - smooth) * (inv_freq[i] / ROPE_SCALING_FACTOR) + smooth * inv_freq[i];
         }
     }
 
-    cudaMalloc(&d_inv_freq, half_dim * sizeof(float));
-    cudaMemcpy(d_inv_freq, inv_freq_llama.data(), half_dim * sizeof(float), cudaMemcpyHostToDevice);
+    std::vector<float> cos_table(MAX_SEQ_LEN * HEAD_DIM);
+    std::vector<float> sin_table(MAX_SEQ_LEN * HEAD_DIM);
 
-    std::vector<float> cos_table(max_seq_len * head_dim);
-    std::vector<float> sin_table(max_seq_len * head_dim);
-
-    for (int pos = 0; pos < max_seq_len; pos++)
+    for (int pos = 0; pos < MAX_SEQ_LEN; pos++)
     {
         for (int i = 0; i < half_dim; i++)
         {
             float angle = pos * inv_freq_llama[i];
             float c = std::cos(angle);
             float s = std::sin(angle);
-            cos_table[pos * head_dim + 2 * i] = c;
-            cos_table[pos * head_dim + 2 * i + 1] = c;
-            sin_table[pos * head_dim + 2 * i] = s;
-            sin_table[pos * head_dim + 2 * i + 1] = s;
+            cos_table[pos * HEAD_DIM + 2 * i] = c;
+            cos_table[pos * HEAD_DIM + 2 * i + 1] = c;
+            sin_table[pos * HEAD_DIM + 2 * i] = s;
+            sin_table[pos * HEAD_DIM + 2 * i + 1] = s;
         }
     }
 
-    cudaMalloc(&d_cos_table, max_seq_len * head_dim * sizeof(float));
-    cudaMalloc(&d_sin_table, max_seq_len * head_dim * sizeof(float));
-    cudaMemcpy(d_cos_table, cos_table.data(),
-               max_seq_len * head_dim * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sin_table, sin_table.data(),
-               max_seq_len * head_dim * sizeof(float), cudaMemcpyHostToDevice);
+    constexpr size_t table_bytes = (size_t)MAX_SEQ_LEN * HEAD_DIM * sizeof(float);
+    cudaMalloc(&d_cos_table, table_bytes);
+    cudaMalloc(&d_sin_table, table_bytes);
+    cudaMemcpy(d_cos_table, cos_table.data(), table_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sin_table, sin_table.data(), table_bytes, cudaMemcpyHostToDevice);
 }
 
-void free_rope_frequencies(void)
-{
-    if (d_inv_freq)
-    {
-        cudaFree(d_inv_freq);
-        d_inv_freq = nullptr;
-    }
-    if (d_cos_table)
-    {
-        cudaFree(d_cos_table);
-        d_cos_table = nullptr;
-    }
-    if (d_sin_table)
-    {
-        cudaFree(d_sin_table);
-        d_sin_table = nullptr;
-    }
-}
+// ---- decode ----
 
-__global__ void ropeKernel_llama3(__nv_bfloat16 *input, int num_tokens, int proj_dim,
-                                  int head_dim, const float *cos_table, const float *sin_table)
-{
-    int token_idx = blockIdx.x;
-    int tid = threadIdx.x;
-    int half_proj = proj_dim / 2;
-    int half_dim = head_dim / 2;
-
-    if (tid >= half_proj)
-        return;
-
-    int head_idx = tid / half_dim;
-    int pair_idx = tid % half_dim;
-
-    int base = token_idx * proj_dim + head_idx * head_dim;
-    int idx1 = base + pair_idx;
-    int idx2 = base + pair_idx + half_dim;
-
-    float x1 = (float)input[idx1];
-    float x2 = (float)input[idx2];
-
-    int table_idx = token_idx * head_dim + pair_idx * 2;
-    float c = cos_table[table_idx];
-    float s = sin_table[table_idx];
-
-    input[idx1] = (__nv_bfloat16)(x1 * c - x2 * s);
-    input[idx2] = (__nv_bfloat16)(x1 * s + x2 * c);
-}
-
-void rope(__nv_bfloat16 *input, int num_tokens, int proj_dim)
-{
-    int num_threads = proj_dim / 2;
-    if (num_threads > 1024)
-    {
-        std::cout << "Can't launch more than 1024 threads on GTX 1650, RoPE kernel not launched";
-        return;
-    }
-
-    ropeKernel_llama3<<<num_tokens, num_threads>>>(
-        input, num_tokens, proj_dim, HEAD_DIM, d_cos_table, d_sin_table);
-
-#ifdef DEBUG
-    cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess)
-    {
-        std::cout << "CUDA error: " << cudaGetErrorString(error)
-                  << " (code: " << error << ")" << std::endl;
-    }
-#endif
-}
-
-__global__ void causalMaskKernel(__nv_bfloat16 *input, int num_tokens)
-{
-    if (threadIdx.x + blockIdx.x * blockDim.x >= num_tokens * num_tokens * NUM_Q_HEADS)
-    {
-        return;
-    }
-
-    int column = threadIdx.x;
-    int row = blockIdx.x % num_tokens;
-    if (column > row)
-    {
-        input[blockIdx.x * num_tokens + threadIdx.x] = -HUGE_VALF;
-    }
-}
-
-void causalMask(__nv_bfloat16 *input, int num_tokens)
-{
-    if (num_tokens > 1024)
-    {
-        std::cout << "Can't launch more than 1024 threads on GTX 1650, Causal mask kernel not launched";
-        return;
-    }
-
-    causalMaskKernel<<<num_tokens * NUM_Q_HEADS, num_tokens>>>(input, num_tokens);
-#ifdef DEBUG
-    cudaError error = cudaGetLastError();
-    if (error != cudaError::cudaSuccess)
-    {
-        std::cout << "CUDA last error: " << cudaGetLastError() << std::endl;
-    }
-#endif
-}
-
-__global__ void softmaxKernel(__nv_bfloat16 *input, int num_tokens)
-{
-    __shared__ float m[1024]; // running max per tree node
-    __shared__ float d[1024]; // running denominator (sum of exp) per tree node
-
-    int workIndex = blockIdx.x * num_tokens + threadIdx.x;
-    float token = (float)input[workIndex];
-
-    // leaf: this thread owns a single element
-    m[threadIdx.x] = token;
-    d[threadIdx.x] = 1.0f;
-    __syncthreads();
-
-    // one reduction: running max AND running sum, before the same __syncthreads()
-    for (int i = 1; i < num_tokens; i = i * 2)
-    {
-        if (threadIdx.x % (i * 2) == 0 && threadIdx.x + i < num_tokens)
-        {
-            float m_a = m[threadIdx.x];
-            float d_a = d[threadIdx.x];
-            float m_b = m[threadIdx.x + i];
-            float d_b = d[threadIdx.x + i];
-
-            float m_new = fmaxf(m_a, m_b);
-            float term_a = (m_a <= -1e30f) ? 0.0f : d_a * expf(m_a - m_new);
-            float term_b = (m_b <= -1e30f) ? 0.0f : d_b * expf(m_b - m_new);
-            float d_new = term_a + term_b;
-
-            m[threadIdx.x] = m_new;
-            d[threadIdx.x] = d_new;
-        }
-        __syncthreads();
-    }
-
-    input[workIndex] = (token <= -1e30f) ? (__nv_bfloat16)0.0f : (__nv_bfloat16)(expf(token - m[0]) / d[0]);
-
-}
-
-// input are masked attention scores (NUM_Q_HEADS, num_tok, num_tok)
-void softmax(__nv_bfloat16 *input, int num_tokens)
-{
-    if (num_tokens > 1024)
-    {
-        std::cout << "Can't launch more than 1024 threads on GTX 1650, Softmax kernel not launched";
-        return;
-    }
-
-    softmaxKernel<<<num_tokens * NUM_Q_HEADS, num_tokens>>>(input, num_tokens);
-#ifdef DEBUG
-    cudaError error = cudaGetLastError();
-    if (error != cudaError::cudaSuccess)
-    {
-        std::cout << "CUDA last error: " << cudaGetLastError() << std::endl;
-    }
-#endif
-}
-
-__global__ void residualKernel(__nv_bfloat16 *input, __nv_bfloat16 *input_embeds)
-{
-    int workIndex = threadIdx.x + blockIdx.x * 2048;
-    input[workIndex] = input[workIndex] + input_embeds[workIndex];
-    input[workIndex + 1024] = input[workIndex + 1024] + input_embeds[workIndex + 1024];
-}
-
-// (num_tok, 2048) + (num_tok, 2048) -> (num_tok, 2048)
-void residualAdd(__nv_bfloat16 *input, __nv_bfloat16 *input_embeds, int num_tokens)
-{
-    residualKernel<<<num_tokens, 1024>>>(input, input_embeds);
-#ifdef DEBUG
-    cudaError error = cudaGetLastError();
-    if (error != cudaError::cudaSuccess)
-    {
-        std::cout << "CUDA last error: " << cudaGetLastError() << std::endl;
-    }
-#endif
-}
-
-__global__ void siluKernel(__nv_bfloat16 *a, __nv_bfloat16 *b)
-{
-    int workIndex = threadIdx.x + blockIdx.x * 8192;
-    for (int i = 0; i < 8192; i += 1024)
-    {
-        a[workIndex + i] = (__nv_bfloat16)((float)a[workIndex + i] * (1 / (1 + expf(-(float)a[workIndex + i]))) * (float)b[workIndex + i]);
-    }
-}
-
-// in-place, overwriting a
-void silu(__nv_bfloat16 *a, __nv_bfloat16 *b, int num_tokens)
-{
-    siluKernel<<<num_tokens, 1024>>>(a, b);
-}
-
-// decode
-__global__ void embeddingGatherKernelDecode(int *gpu_last_tokens, int num_tokens, __nv_bfloat16 *output, __nv_bfloat16 *embed_tokens)
+__global__ void embeddingGatherDecodeKernel(int *gpu_last_tokens, int num_tokens, __nv_bfloat16 *output, __nv_bfloat16 *embed_tokens)
 {
     int input_token = gpu_last_tokens[blockIdx.x];
-    int workIndex = blockIdx.x * 2048 + threadIdx.x;
-    if (workIndex < num_tokens * 2048)
+    int workIndex = blockIdx.x * EMBEDDING_LENGTH + threadIdx.x;
+    if (workIndex < num_tokens * EMBEDDING_LENGTH)
     {
-        output[workIndex] = embed_tokens[input_token * 2048 + threadIdx.x];
-        output[workIndex + 1024] = embed_tokens[input_token * 2048 + threadIdx.x + 1024];
+        output[workIndex] = embed_tokens[input_token * EMBEDDING_LENGTH + threadIdx.x];
+        output[workIndex + EMBED_HALF] = embed_tokens[input_token * EMBEDDING_LENGTH + threadIdx.x + EMBED_HALF];
     }
 }
 
-void embeddingGatherDecode(int *gpu_last_tokens, int num_tokens, __nv_bfloat16 *output, __nv_bfloat16 *embed_tokens)
-{
-    // even though embedding is 2048, I can only dispatch 1024 because it's max threads per block on my gpu
-    embeddingGatherKernelDecode<<<num_tokens, 1024>>>(gpu_last_tokens, num_tokens, output, embed_tokens);
-#ifdef DEBUG
-    cudaError error = cudaGetLastError();
-    if (error != cudaError::cudaSuccess)
-    {
-        std::cout << "CUDA last error: " << cudaGetLastError() << std::endl;
-    }
-#endif
-}
-
-__global__ void ropeKernelDecode_llama3(__nv_bfloat16 *input, int position_in_sequence, int proj_dim,
-                                        int head_dim, const float *cos_table, const float *sin_table)
+__global__ void ropeDecodeKernel(__nv_bfloat16 *input, int position_in_sequence, int proj_dim,
+                                 const float *cos_table, const float *sin_table)
 {
     int tid = threadIdx.x;
     int half_proj = proj_dim / 2;
-    int half_dim = head_dim / 2;
+    constexpr int half_dim = HEAD_DIM / 2;
 
     if (tid >= half_proj)
         return;
@@ -384,95 +131,25 @@ __global__ void ropeKernelDecode_llama3(__nv_bfloat16 *input, int position_in_se
     int head_idx = tid / half_dim;
     int pair_idx = tid % half_dim;
 
-    int base = head_idx * head_dim;
+    int base = head_idx * HEAD_DIM;
     int idx1 = base + pair_idx;
     int idx2 = base + pair_idx + half_dim;
 
     float x1 = (float)input[idx1];
     float x2 = (float)input[idx2];
 
-    int table_idx = position_in_sequence * head_dim + pair_idx * 2;
+    int table_idx = position_in_sequence * HEAD_DIM + pair_idx * 2;
     float c = cos_table[table_idx];
     float s = sin_table[table_idx];
 
     input[idx1] = (__nv_bfloat16)(x1 * c - x2 * s);
     input[idx2] = (__nv_bfloat16)(x1 * s + x2 * c);
-}
-
-void ropeDecode(__nv_bfloat16 *input, int position_in_sequence, int proj_dim)
-{
-    int num_threads = proj_dim / 2;
-    if (num_threads > 1024)
-    {
-        std::cout << "Can't launch more than 1024 threads on GTX 1650, RoPE kernel not launched";
-        return;
-    }
-
-    ropeKernelDecode_llama3<<<1, num_threads>>>(input, position_in_sequence, proj_dim, HEAD_DIM, d_cos_table, d_sin_table);
-#ifdef DEBUG
-    cudaError error = cudaGetLastError();
-    if (error != cudaError::cudaSuccess)
-    {
-        std::cout << "CUDA last error: " << cudaGetLastError() << std::endl;
-    }
-#endif
-}
-
-// seq_len increases by 1 with every new token
-__global__ void softmaxKernelDecode(__nv_bfloat16 *input, int seq_len)
-{
-    __shared__ float m[1024];
-    __shared__ float d[1024];
-
-    int workIndex = blockIdx.x * MAX_SEQ_LEN + threadIdx.x;
-    float token = (float)input[workIndex];
-
-    m[threadIdx.x] = token;
-    d[threadIdx.x] = 1.0f;
-    __syncthreads();
-
-    for (int i = 1; i < seq_len; i = i * 2)
-    {
-        if (threadIdx.x % (i * 2) == 0 && threadIdx.x + i < seq_len)
-        {
-            float m_a = m[threadIdx.x];
-            float d_a = d[threadIdx.x];
-            float m_b = m[threadIdx.x + i];
-            float d_b = d[threadIdx.x + i];
-
-            float m_new = fmaxf(m_a, m_b);
-            float d_new = d_a * expf(m_a - m_new) + d_b * expf(m_b - m_new);
-
-            m[threadIdx.x] = m_new;
-            d[threadIdx.x] = d_new;
-        }
-        __syncthreads();
-    }
-
-    input[workIndex] = (__nv_bfloat16)(expf(token - m[0]) / d[0]);
-}
-
-// input are masked attention scores (NUM_Q_HEADS, seq_len)
-void softmaxDecode(__nv_bfloat16 *input, int seq_len)
-{
-    if (seq_len > 1024)
-    {
-        std::cout << "Can't launch more than 1024 threads on GTX 1650, Softmax kernel not launched";
-        return;
-    }
-
-    softmaxKernelDecode<<<NUM_Q_HEADS, seq_len>>>(input, seq_len);
-#ifdef DEBUG
-    cudaError error = cudaGetLastError();
-    if (error != cudaError::cudaSuccess)
-    {
-        std::cout << "CUDA last error: " << cudaGetLastError() << std::endl;
-    }
-#endif
 }
 
 // inside a single particular thread that processes a single position of particular Q head for a particular sequence, for particular layer
-__global__ void pagedAttentionKernel(int layer, int num_active_slots, __nv_bfloat16 *q_proj, __nv_bfloat16 *kv_cache, int *block_table_gpu, int *gpu_seq_lens, int *gpu_active_slots, __nv_bfloat16 *output)
+__global__ void pagedAttentionKernel(int layer, int num_active_slots, __nv_bfloat16 *q_proj,
+                                     __nv_bfloat16 *kv_cache, int *block_table_gpu, int *gpu_seq_lens,
+                                     int *gpu_active_slots, __nv_bfloat16 *output)
 {
     __shared__ float dot_products[2];
     int active_slot = blockIdx.x; // active_slot == seq_id
@@ -509,7 +186,7 @@ __global__ void pagedAttentionKernel(int layer, int num_active_slots, __nv_bfloa
             {
                 dot_products[0] = qk;
             }
-            if (thread_id == 32)
+            if (thread_id == WARP_SIZE)
             {
                 dot_products[1] = qk;
             }
@@ -531,12 +208,221 @@ __global__ void pagedAttentionKernel(int layer, int num_active_slots, __nv_bfloa
             float exp_score = expf(dot_product - current_max);
             d = d * correction_factor + exp_score;
             acc = acc * correction_factor + exp_score * (float)*v;
+            // Warp 0 overwrites dot_products[0] for the next token as soon as it gets
+            // there, so without this barrier warp 1 can still be reading the current
+            // token's score when that write lands. Both loop bounds are block-uniform
+            // (seq_len and logical_block_idx are), so every thread reaches this barrier.
+            __syncthreads();
         }
     }
     output[active_slot * EMBEDDING_LENGTH + q_head_id * HEAD_DIM + thread_id] = acc / d;
 }
 
-void pagedAttention(int layer, int num_active_slots, __nv_bfloat16 *q_proj, __nv_bfloat16 *kv_cache, int *block_table_gpu, int *gpu_seq_lens, int *gpu_active_slots, __nv_bfloat16 *output)
+// ---- batched ("packed") prefill ----
+
+__global__ void embeddingGatherKernel(int *gpu_input_tokens, __nv_bfloat16 *gpu_input_embeds, __nv_bfloat16 *embed_tokens, int num_input_tokens)
 {
-    pagedAttentionKernel<<<dim3(num_active_slots, NUM_Q_HEADS), HEAD_DIM>>>(layer, num_active_slots, q_proj, kv_cache, block_table_gpu, gpu_seq_lens, gpu_active_slots, output);
+    int workIndex = threadIdx.x + blockIdx.x * EMBEDDING_LENGTH;
+    if (workIndex < num_input_tokens * EMBEDDING_LENGTH)
+    {
+        gpu_input_embeds[workIndex] = embed_tokens[gpu_input_tokens[blockIdx.x] * EMBEDDING_LENGTH + threadIdx.x];
+        gpu_input_embeds[workIndex + EMBED_HALF] = embed_tokens[gpu_input_tokens[blockIdx.x] * EMBEDDING_LENGTH + threadIdx.x + EMBED_HALF];
+    }
+}
+
+__global__ void ropePackedKernel(__nv_bfloat16 *input, int num_tokens, int proj_dim,
+                                 const int *token_positions, const float *cos_table,
+                                 const float *sin_table)
+{
+    int token_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    int half_proj = proj_dim / 2;
+    constexpr int half_dim = HEAD_DIM / 2;
+
+    if (token_idx >= num_tokens || tid >= half_proj)
+        return;
+
+    int head_idx = tid / half_dim;
+    int pair_idx = tid % half_dim;
+
+    size_t base = (size_t)token_idx * proj_dim + head_idx * HEAD_DIM;
+    size_t idx1 = base + pair_idx;
+    size_t idx2 = base + pair_idx + half_dim;
+
+    float x1 = (float)input[idx1];
+    float x2 = (float)input[idx2];
+
+    // the only difference from ropeDecodeKernel: the angle comes from the token's
+    // position inside its own prompt, not from its index in the packed buffer
+    int table_idx = token_positions[token_idx] * HEAD_DIM + pair_idx * 2;
+    float c = cos_table[table_idx];
+    float s = sin_table[table_idx];
+
+    input[idx1] = (__nv_bfloat16)(x1 * c - x2 * s);
+    input[idx2] = (__nv_bfloat16)(x1 * s + x2 * c);
+}
+
+__global__ void scatterKVPackedKernel(int layer, int num_tokens, const __nv_bfloat16 *k_src,
+                                      const __nv_bfloat16 *v_src, __nv_bfloat16 *kv_cache,
+                                      const int *block_table_gpu, const int *token_slot_ids,
+                                      const int *token_positions)
+{
+    int token_idx = blockIdx.x;
+    if (token_idx >= num_tokens)
+        return;
+
+    int slot = token_slot_ids[token_idx];
+    int position = token_positions[token_idx];
+    int logical_block_idx = position / BLOCK_SIZE;
+    int token_in_block_idx = position % BLOCK_SIZE;
+
+    int physical_block = block_table_gpu[slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx];
+    if (physical_block < 0)
+        return; // host failed to reserve the page, nothing sane to write
+
+    char *page = (char *)kv_cache + (size_t)physical_block * BLOCK_BYTES + (size_t)token_in_block_idx * KV_DIM * sizeof(__nv_bfloat16);
+    __nv_bfloat16 *k_dst = (__nv_bfloat16 *)page;
+    __nv_bfloat16 *v_dst = (__nv_bfloat16 *)(page + V_OFFSET);
+
+    size_t src = (size_t)token_idx * KV_DIM + threadIdx.x;
+    k_dst[threadIdx.x] = k_src[src];
+    v_dst[threadIdx.x] = v_src[src];
+}
+
+// Flash-attention style prefill attention over the packed batch: one launch per layer for
+// the whole batch, and nothing of size seq_len^2 is ever materialised. The old path built a
+// (NUM_Q_HEADS, L, L) score buffer per prompt and walked it three times (mask, softmax,
+// scores*V); for L=512 that is ~96 MiB of traffic per prompt per layer, and it needed 66
+// kernel/GEMM launches per prompt per layer on top.
+//
+// grid  = (num_tiles, NUM_Q_HEADS): one block per (tile of query tokens, Q head)
+// block = PREFILL_ATTN_QUERIES_PER_TILE warps of 32 lanes; warp w owns query token
+//         tile_token_begin[tile] + w and keeps its own online softmax state end to end,
+//         so there is no cross-warp reduction.
+// Each lane owns head dim elements `lane` and `lane + 32` (HEAD_DIM is 64).
+//
+// The warps of a block step through their prompt's keys together, staging
+// PREFILL_ATTN_KEYS_PER_TILE keys of K and V in shared memory at a time. That staging is
+// the whole point: one query token per block meant every query re-read all of K and V from
+// DRAM (~70 GB for a full 16-prompt batch, ~300 ms on this card's 192 GB/s), whereas a tile
+// of 8 queries reads each K/V element once for all 8.
+__global__ void prefillAttentionKernel(const __nv_bfloat16 *q_proj, const __nv_bfloat16 *k_packed,
+                                       const __nv_bfloat16 *v_packed, const int *tile_token_begin,
+                                       const int *tile_token_count, const int *token_seq_start,
+                                       const int *token_positions, __nv_bfloat16 *output)
+{
+    // 2 * 32 * 64 * 2 B = 8 KiB, so 4 blocks of 256 threads still fit in the 64 KiB an SM has
+    __shared__ __nv_bfloat16 k_tile[PREFILL_ATTN_KEYS_PER_TILE][HEAD_DIM];
+    __shared__ __nv_bfloat16 v_tile[PREFILL_ATTN_KEYS_PER_TILE][HEAD_DIM];
+
+    int tile = blockIdx.x;
+    int q_head_id = blockIdx.y;
+    int kv_head_idx = q_head_id / GQA_Q_TO_K_RATIO;
+
+    int warp = threadIdx.x / PREFILL_ATTN_LANES;
+    int lane = threadIdx.x % PREFILL_ATTN_LANES;
+
+    int token_begin = tile_token_begin[tile];
+    int token_count = tile_token_count[tile];
+    int seq_start = token_seq_start[token_begin];
+    // how far the block as a whole has to walk: the last query in the tile sits deepest
+    int tile_num_keys = token_positions[token_begin + token_count - 1] + 1;
+
+    // the final tile of a prompt can be short, those warps idle but still have to reach
+    // every __syncthreads() below
+    bool active = warp < token_count;
+    int token_idx = token_begin + warp;
+    int num_keys = active ? token_positions[token_idx] + 1 : 0; // causal limit for this query
+
+    // Reading and writing the same q_proj rows is safe: block (tile, head) is the only block
+    // touching q_proj[token, head, :] for its tokens, and it loads them before writing anything.
+    float q0 = 0.0f;
+    float q1 = 0.0f;
+    if (active)
+    {
+        const __nv_bfloat16 *q = q_proj + (size_t)token_idx * EMBEDDING_LENGTH + q_head_id * HEAD_DIM;
+        q0 = (float)q[lane];
+        q1 = (float)q[lane + PREFILL_ATTN_LANES];
+    }
+
+    // online softmax, same recurrence as pagedAttentionKernel
+    float current_max = -INFINITY;
+    float denom = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    for (int base = 0; base < tile_num_keys; base += PREFILL_ATTN_KEYS_PER_TILE)
+    {
+        int keys_staged = min(PREFILL_ATTN_KEYS_PER_TILE, tile_num_keys - base);
+
+        for (int element = threadIdx.x; element < keys_staged * HEAD_DIM; element += PREFILL_ATTN_THREADS)
+        {
+            int key = element / HEAD_DIM;
+            int head_dim_idx = element % HEAD_DIM;
+            size_t row = (size_t)(seq_start + base + key) * KV_DIM + kv_head_idx * HEAD_DIM + head_dim_idx;
+            k_tile[key][head_dim_idx] = k_packed[row];
+            v_tile[key][head_dim_idx] = v_packed[row];
+        }
+        __syncthreads();
+
+        // keys_staged is block-uniform and num_keys is warp-uniform, so every lane of a warp
+        // runs the same number of iterations and the shuffles below stay full-warp
+        int keys_for_this_query = min(keys_staged, num_keys - base);
+        for (int key = 0; key < keys_for_this_query; ++key)
+        {
+            float dot = q0 * (float)k_tile[key][lane] + q1 * (float)k_tile[key][lane + PREFILL_ATTN_LANES];
+            // xor shuffle so every lane ends up with the full 64-element dot product
+            for (int offset = PREFILL_ATTN_LANES / 2; offset > 0; offset >>= 1)
+            {
+                dot += __shfl_xor_sync(WARP_FULL_MASK, dot, offset);
+            }
+            dot /= SQRT_HEAD_DIM;
+
+            // Same online softmax recurrence as pagedAttentionKernel, rearranged: the
+            // running max only moves O(log n) times, so most keys skip the rescale and its
+            // exp. dot is warp-uniform, so this branch never diverges.
+            float exp_score;
+            if (dot > current_max)
+            {
+                float correction_factor = (current_max == -INFINITY) ? 0.0f : __expf(current_max - dot);
+                current_max = dot;
+                denom *= correction_factor;
+                acc0 *= correction_factor;
+                acc1 *= correction_factor;
+                exp_score = 1.0f; // exp(dot - current_max) with current_max just set to dot
+            }
+            else
+            {
+                exp_score = __expf(dot - current_max);
+            }
+
+            denom += exp_score;
+            acc0 += exp_score * (float)v_tile[key][lane];
+            acc1 += exp_score * (float)v_tile[key][lane + PREFILL_ATTN_LANES];
+        }
+        __syncthreads(); // nobody may overwrite the staged tile while a slower warp still reads it
+    }
+
+    if (active)
+    {
+        // num_keys >= 1 for an active warp and the key at the running max contributes
+        // exp(0) = 1, so denom >= 1
+        __nv_bfloat16 *out = output + (size_t)token_idx * EMBEDDING_LENGTH + q_head_id * HEAD_DIM;
+        out[lane] = (__nv_bfloat16)(acc0 / denom);
+        out[lane + PREFILL_ATTN_LANES] = (__nv_bfloat16)(acc1 / denom);
+    }
+}
+
+// Picks out the rows named by row_indices, which lets the lm_head GEMM run on just the
+// last token of every prompt instead of on all of them. That GEMM is
+// (num_rows, 2048) x (2048, 128256): at 512 tokens it is 269 GFLOP per prompt and all but
+// one row of the result was thrown away.
+__global__ void gatherRowsKernel(const __nv_bfloat16 *src, __nv_bfloat16 *dst, const int *row_indices, int num_rows)
+{
+    if (blockIdx.x >= num_rows)
+        return;
+    size_t src_base = (size_t)row_indices[blockIdx.x] * EMBEDDING_LENGTH + threadIdx.x;
+    size_t dst_base = (size_t)blockIdx.x * EMBEDDING_LENGTH + threadIdx.x;
+    dst[dst_base] = src[src_base];
+    dst[dst_base + EMBED_HALF] = src[src_base + EMBED_HALF];
 }

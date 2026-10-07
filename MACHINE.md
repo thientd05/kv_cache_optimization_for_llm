@@ -77,7 +77,9 @@ The engine stores all weights and activations as `__nv_bfloat16`. On `sm_75`:
 
 System RAM is the tighter constraint for host-side work: `loadWeights` reads the
 whole safetensors payload into a host `std::vector` (~2.3 GiB) before the
-`cudaMemcpy`, which is a significant fraction of available RAM.
+`cudaMemcpy`, which is a significant fraction of available RAM. The host-side logits
+staging buffer `embed_proj_cpu` is 7.58 MiB (`BATCH_SIZE × VOCAB_SIZE`); it used to be
+125 MiB when prefill computed logits for every prompt token.
 
 ## Software stack
 
@@ -126,26 +128,41 @@ rather than the cache if in doubt.
 ## VRAM budget (why the constants are what they are)
 
 With the current constants — `MAX_SEQ_LEN 2048`, `MAX_PROMPT_LEN 512`,
-`BATCH_SIZE 16`, `BLOCK_SIZE 16`, `KV_CACHE_SIZE_BYTES 1000 MiB`:
+`MAX_BATCH_TOKENS 3072`, `BLOCK_SIZE 16`, `KV_CACHE_SIZE_BYTES 1000 MiB`, and
+`BATCH_SIZE` **derived** from the KV cache as 31 (see below):
 
 | Allocation | Size |
 | --- | --- |
 | `model_weights` | 2357.14 MiB |
 | `kv_cache` | 1000.00 MiB |
-| `embed_proj` (logits, 512 × 128256 bf16) | 125.25 MiB |
-| `prefill_attn_scores` (512² × 32 bf16) | 16.00 MiB |
-| `gate` + `up` (512 × 8192 bf16 each) | 16.00 MiB |
-| 4 × `EMBEDDING_LENGTH` buffers + `input_embeddings` | 10.00 MiB |
+| `gate` + `up` (3072 × 8192 bf16 each) | 96.00 MiB |
+| `hidden_state`, `rms_norms`, `buf_2048_1`, `buf_2048_2` (3072 × 2048 bf16 each) | 48.00 MiB |
+| `k/v_proj_temp_buf` (3072 × 512 bf16 each) | 6.00 MiB |
+| `embed_proj` (logits, 31 × 128256 bf16) | 7.58 MiB |
 | RoPE cos/sin tables | 1.00 MiB |
-| `k/v_proj_temp_buf`, block table, misc | ~1.16 MiB |
-| **Total** | **≈ 3526 MiB = 3.44 GiB** |
+| block table, per-token index arrays, attn tiles, `last_hidden`, misc | ~0.3 MiB |
+| **Total** | **≈ 3516 MiB = 3.43 GiB** |
 | Available | 3715 MiB = 3.63 GiB |
-| **Headroom** | **≈ 188 MiB** |
+| **Headroom** | **≈ 123 MiB** (measured, printed at startup) |
 
-This is why `KV_CACHE_SIZE_BYTES` is 1000 MiB rather than the 2 GiB the upstream
-code used: 2 GiB does not fit in 3.63 GiB alongside 2.30 GiB of weights.
-`embed_proj` is the third-largest allocation and scales with `MAX_PROMPT_LEN ×
-VOCAB_SIZE` — it is the first thing to shrink if more headroom is needed.
+`KV_CACHE_SIZE_BYTES` is 1000 MiB rather than the 2 GiB the upstream code used: 2 GiB
+does not fit in 3.63 GiB alongside 2.30 GiB of weights.
+
+The per-token buffers are sized for `MAX_BATCH_TOKENS`, not `MAX_PROMPT_LEN`, because
+prefill runs the whole batch of prompts as one packed pass (see `prefillBatch`). At
+~50 KiB per token they are the second-largest group after the weights and the KV cache,
+and `MAX_BATCH_TOKENS` is the knob to turn if more headroom is needed. That pass only
+fits because two older allocations are gone:
+
+- `embed_proj` used to be `MAX_PROMPT_LEN × VOCAB_SIZE` (125.25 MiB) because prefill ran
+  the lm_head over every prompt token and then threw away all but the last row. It now
+  holds `BATCH_SIZE` rows (7.58 MiB), one per prompt.
+- `prefill_attn_scores`, the materialised `(NUM_Q_HEADS, L, L)` attention score buffer
+  (16 MiB), is gone entirely — `prefillAttention` is a flash-style kernel that keeps its
+  online softmax state in registers.
+
+The engine prints `Scratch allocated for MAX_BATCH_TOKENS=... VRAM left: N MiB` once
+everything is allocated; check that line rather than this table after changing constants.
 
 ### Paging arithmetic
 
@@ -154,11 +171,19 @@ VOCAB_SIZE` — it is the first thing to shrink if more headroom is needed.
 - `MAX_BLOCKS_PER_SEQ` = 2048 / 16 = **128**
 - KV footprint per token = 32768 B across all 16 layers (2048 B per layer)
 
-Worth knowing: a fully-loaded batch (16 sequences × 16 layers × 128 pages) would
-want 32768 pages but only 32000 exist, so the pool is ~2% oversubscribed at the
-absolute worst case. Not reachable in practice since `MAX_PROMPT_LEN` is 512 and
-`MAX_NEW_TOKENS_GENERATED` is 512, capping a sequence at ~1024 tokens = 64 pages
-per layer (16 × 16 × 64 = 16384 pages, half the pool).
+`BATCH_SIZE` is **derived from this pool**, not hardcoded. `MAX_PROMPT_LEN` (512) plus
+`MAX_NEW_TOKENS_GENERATED` (512) caps a sequence at 1024 tokens = 64 pages per layer, so
+`PAGES_PER_SEQUENCE` = 16 × 64 = 1024 and `BATCH_SIZE` = 32000 / 1024 = **31** decode
+slots. Because that is the exact worst case, `free_blocks` can never run dry, and the
+limit follows along if `KV_CACHE_SIZE_BYTES`, `BLOCK_SIZE`, `N_LAYERS` or either length
+cap is changed.
+
+The hardcoded `BATCH_SIZE 16` it replaced left half the pool idle: decode is
+bandwidth-bound (every step streams all 2.30 GiB of weights regardless of how many slots
+are active), so slots are nearly free throughput. Measured aggregate decode: **112 tok/s
+at 16 slots vs 226 tok/s at 31**, for +3.87 MiB of VRAM. The engine reports the derived
+value as `{"type":"engine_config","batch_size":N}` at startup; `client.py` reads that
+instead of hardcoding it.
 
 ## Practical implications
 
@@ -169,8 +194,17 @@ per layer (16 × 16 × 64 = 16384 pages, half the pool).
 2. **No tensor cores** — bf16 GEMMs are FP32-rate. Profiling numbers will look
    nothing like Ampere/Ada/Blackwell results.
 3. **192 GB/s bandwidth with 14 SMs** means decode is firmly memory-bound;
-   streaming 2.30 GiB of weights per token caps decode at ~78 tokens/s even at
-   100% bandwidth efficiency.
-4. **188 MiB of VRAM headroom.** Any new persistent allocation needs a matching
-   reduction elsewhere. Run with no other GPU consumers — Xorg already takes a
-   few MiB, and a browser can easily take hundreds.
+   streaming 2.30 GiB of weights per step caps the *step rate* at ~78 steps/s even at
+   100% bandwidth efficiency — but that cost is shared by every active slot, so
+   aggregate decode throughput scales almost linearly with `BATCH_SIZE` until the
+   CPU-side argmax (O(`BATCH_SIZE` × `VOCAB_SIZE`) per step) catches up. It has not
+   yet at 31 slots.
+4. **~123 MiB of VRAM headroom.** Any new persistent allocation needs a matching
+   reduction elsewhere, most likely a smaller `MAX_BATCH_TOKENS`. Run with no other
+   GPU consumers — Xorg already takes a few MiB, and a browser can easily take hundreds.
+5. **Prefill is GEMM-bound, decode is bandwidth-bound.** The transformer body is
+   ~1.94 GFLOP per prompt token, so prefilling 907 tokens costs ~1.76 TFLOP no matter
+   how it is batched; measured packed prefill does it in ~1.22 s, i.e. ~1.44 TFLOP/s or
+   ~53% of the FP32 peak, which is about the ceiling for bf16 cuBLAS without tensor
+   cores. Batching prefill therefore buys overhead (launches, weight streams, the
+   wasted lm_head rows), not FLOPs — measured 2115 ms -> 1225 ms for 16 prompts.
