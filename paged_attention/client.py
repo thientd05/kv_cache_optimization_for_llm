@@ -29,12 +29,28 @@ MODEL_DIR = os.environ.get(
 # message that is never coming is the one failure mode that looks like a freeze.
 STALL_TIMEOUT_S = float(os.environ.get("STALL_TIMEOUT_S", "120"))
 
-# Prompts only ever come from a file, one per line: this is a benchmark harness, not a chat.
-# Read it before anything expensive happens, so a bad path fails now rather than after the
-# tokenizer and 2.30 GiB of weights have been loaded.
-PROMPTS_FILE = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "prompts.txt"
-)
+# Prompts only ever come from prompts.txt, one per line: this is a benchmark harness, not a
+# chat. The single optional argument is how many of them to run, counted from the top, so
+# sweeping batch sizes over the same prompts is just `client.py 1`, `client.py 8`, ...
+USAGE = f"usage: {os.path.basename(sys.argv[0])} [number of prompts to run]"
+PROMPTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts.txt")
+
+# Argument and file are both checked before anything expensive happens, so a typo fails now
+# rather than after the tokenizer and 2.30 GiB of weights have been loaded.
+if len(sys.argv) > 2:
+    print(USAGE, file=sys.stderr)
+    sys.exit(2)
+limit = None
+if len(sys.argv) == 2:
+    try:
+        limit = int(sys.argv[1])
+    except ValueError:
+        print(f"{USAGE}\n'{sys.argv[1]}' is not an integer.", file=sys.stderr)
+        sys.exit(2)
+    if limit < 1:
+        print(f"{USAGE}\nAsked for {limit} prompts; it takes at least 1.", file=sys.stderr)
+        sys.exit(2)
+
 try:
     with open(PROMPTS_FILE, "r", encoding="utf-8") as f:
         prompts = [line.strip() for line in f if line.strip()]
@@ -44,7 +60,17 @@ except OSError as exc:
 if not prompts:
     print(f"No prompts in {PROMPTS_FILE}.", file=sys.stderr)
     sys.exit(1)
-print(f"Loaded {len(prompts)} prompt(s) from {PROMPTS_FILE}")
+
+available = len(prompts)
+if limit is not None:
+    if limit > available:
+        # Running fewer prompts than asked would quietly report a batch size that is not the
+        # one on the command line, which is exactly the number a benchmark gets compared on.
+        print(f"Asked for {limit} prompts but {PROMPTS_FILE} only has {available}.",
+              file=sys.stderr)
+        sys.exit(1)
+    prompts = prompts[:limit]
+print(f"Running {len(prompts)} of {available} prompt(s) from {PROMPTS_FILE}")
 
 print(f"Loading tokenizer from {MODEL_DIR}...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)

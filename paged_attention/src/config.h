@@ -52,6 +52,24 @@ constexpr int MAX_SEQ_LEN = 2048;             // TODO: make it tunable
 constexpr int MAX_PROMPT_LEN = 512;           // TODO: arbitrary, tunable
 constexpr float REPETITION_PENALTY = 1.15f;
 
+// ---- GPU argmax ----
+// A step's logits are a (rows, VOCAB_SIZE) bf16 block and all the host needs out of them is
+// one token id per row. Bringing the whole block back (BATCH_SIZE * 128256 bf16 = 7.58 MiB
+// per step over PCIe) and scanning it on one core cost far more than the reduction itself,
+// so the argmax runs on the device in two passes: ARGMAX_CHUNKS_PER_ROW blocks per row each
+// reduce a contiguous slice of the vocabulary, then one block per row reduces those
+// partials. Only the resulting ints come back, 4 bytes per row instead of 256 KiB.
+//
+// The chunk count is what keeps the card busy: one block per row would leave a 14-SM GPU
+// with BATCH_SIZE blocks of work, so each row is cut into this many independent pieces.
+constexpr int ARGMAX_CHUNKS_PER_ROW = 128;
+constexpr int ARGMAX_BLOCK_THREADS = 256;
+constexpr int ARGMAX_CHUNK_TOKENS = (VOCAB_SIZE + ARGMAX_CHUNKS_PER_ROW - 1) / ARGMAX_CHUNKS_PER_ROW;
+// the second pass is a tree reduction over a single block of ARGMAX_CHUNKS_PER_ROW threads
+static_assert(ARGMAX_CHUNKS_PER_ROW <= MAX_THREADS_PER_BLOCK, "the finalize pass needs one thread per chunk");
+static_assert((ARGMAX_CHUNKS_PER_ROW & (ARGMAX_CHUNKS_PER_ROW - 1)) == 0, "the finalize pass halves the thread count, so it must be a power of two");
+static_assert(ARGMAX_BLOCK_THREADS % WARP_SIZE == 0, "the first pass reduces warp by warp");
+
 // ---- paged KV cache ----
 constexpr int BLOCK_SIZE = 16; // TODO: tunable as well, defines the size of a single page in pagedattn
 constexpr int V_OFFSET = BLOCK_SIZE * KV_DIM * sizeof(__nv_bfloat16);

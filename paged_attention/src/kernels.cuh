@@ -78,3 +78,35 @@ __global__ void ropeDecodeKernel(__nv_bfloat16 *input, int position_in_sequence,
 __global__ void pagedAttentionKernel(int layer, int num_active_slots, __nv_bfloat16 *q_proj,
                                      __nv_bfloat16 *kv_cache, int *block_table_gpu, int *gpu_seq_lens,
                                      int *gpu_active_slots, __nv_bfloat16 *output);
+
+// ---- sampling ----
+//
+// Greedy sampling of one token per logits row, entirely on the device. The host used to copy
+// the whole (rows, VOCAB_SIZE) logits block back and scan it, which is 7.58 MiB over PCIe
+// plus a 4M-element single-threaded scan every decode step; now only the sampled ids come
+// back. See the GPU argmax section of config.h for the two-pass shape.
+//
+// The repetition penalty moved along with it, because it has to be applied before the
+// comparison. Instead of uploading each sequence's token history every step, the engine
+// keeps a [BATCH_SIZE, VOCAB_SIZE] byte mask on the device, with a 1 for every token the
+// sequence has already emitted; markSampledTokensKernel maintains it. That is the same
+// "penalise each distinct previous token once" rule the host-side std::unordered_set had.
+
+// <<<dim3(ARGMAX_CHUNKS_PER_ROW, num_rows), ARGMAX_BLOCK_THREADS>>>
+// First pass: block (c, row) reduces tokens [c * ARGMAX_CHUNK_TOKENS, +ARGMAX_CHUNK_TOKENS)
+// of its row to one (value, index) pair at partials[row * ARGMAX_CHUNKS_PER_ROW + c].
+// penalty_mask may be null, which skips the repetition penalty; when it is given,
+// row_slot_ids[row] names the slot whose mask row applies to logits row `row`.
+__global__ void argmaxPartialKernel(const __nv_bfloat16 *logits, int num_rows,
+                                    const unsigned char *penalty_mask, const int *row_slot_ids,
+                                    float *partial_values, int *partial_indices);
+
+// <<<num_rows, ARGMAX_CHUNKS_PER_ROW>>>
+// Second pass: reduces one row's partials and writes the winning token id to sampled_tokens.
+__global__ void argmaxFinalizeKernel(const float *partial_values, const int *partial_indices,
+                                     int num_rows, int *sampled_tokens);
+
+// <<<1, BATCH_SIZE>>>, one thread per row
+// Records this step's sampled token in the owning slot's penalty mask row.
+__global__ void markSampledTokensKernel(const int *sampled_tokens, const int *row_slot_ids,
+                                        int num_rows, unsigned char *penalty_mask);

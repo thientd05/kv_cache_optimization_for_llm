@@ -426,3 +426,132 @@ __global__ void gatherRowsKernel(const __nv_bfloat16 *src, __nv_bfloat16 *dst, c
     dst[dst_base] = src[src_base];
     dst[dst_base + EMBED_HALF] = src[src_base + EMBED_HALF];
 }
+
+// ---- sampling ----
+
+// Keeps the better of two (value, index) candidates. The tie-break on the lower index is
+// what the host scan did implicitly with its strict `>`, and it has to be kept: ties on
+// bf16 logits are not rare at all (bf16 has 8 mantissa bits, so a 128k-entry row has plenty
+// of exactly equal values), and without it the sampled token would depend on how the
+// vocabulary happened to be split across blocks.
+__device__ __forceinline__ void argmaxMerge(float &best_value, int &best_index, float value, int index)
+{
+    if (value > best_value || (value == best_value && index < best_index))
+    {
+        best_value = value;
+        best_index = index;
+    }
+}
+
+__global__ void argmaxPartialKernel(const __nv_bfloat16 *logits, int num_rows,
+                                    const unsigned char *penalty_mask, const int *row_slot_ids,
+                                    float *partial_values, int *partial_indices)
+{
+    const int row = blockIdx.y;
+    if (row >= num_rows)
+    {
+        return;
+    }
+
+    const int chunk_begin = blockIdx.x * ARGMAX_CHUNK_TOKENS;
+    const int chunk_end = min(chunk_begin + ARGMAX_CHUNK_TOKENS, VOCAB_SIZE);
+
+    const __nv_bfloat16 *row_logits = logits + (size_t)row * VOCAB_SIZE;
+    // the mask is indexed by slot, the logits by their position in this pass
+    const unsigned char *row_mask = penalty_mask == nullptr
+                                        ? nullptr
+                                        : penalty_mask + (size_t)row_slot_ids[row] * VOCAB_SIZE;
+
+    float best_value = -INFINITY;
+    int best_index = VOCAB_SIZE; // out of range, so a chunk that saw nothing never wins a tie
+
+    // consecutive threads read consecutive tokens, so every pass over the row is coalesced
+    for (int token = chunk_begin + threadIdx.x; token < chunk_end; token += ARGMAX_BLOCK_THREADS)
+    {
+        float logit = (float)row_logits[token];
+        if (row_mask != nullptr && row_mask[token] != 0)
+        {
+            // same two-sided penalty as before: divide a positive logit, multiply a negative
+            // one, so either way the token is pushed down
+            logit = logit > 0.0f ? logit / REPETITION_PENALTY : logit * REPETITION_PENALTY;
+        }
+        argmaxMerge(best_value, best_index, logit, token);
+    }
+
+    // reduce inside the warp first; a lane whose partner does not exist shuffles its own
+    // value back, and merging a candidate with itself changes nothing
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+    {
+        float other_value = __shfl_down_sync(WARP_FULL_MASK, best_value, offset);
+        int other_index = __shfl_down_sync(WARP_FULL_MASK, best_index, offset);
+        argmaxMerge(best_value, best_index, other_value, other_index);
+    }
+
+    constexpr int warps_per_block = ARGMAX_BLOCK_THREADS / WARP_SIZE;
+    __shared__ float warp_values[warps_per_block];
+    __shared__ int warp_indices[warps_per_block];
+
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    if (lane == 0)
+    {
+        warp_values[warp] = best_value;
+        warp_indices[warp] = best_index;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        for (int other = 1; other < warps_per_block; ++other)
+        {
+            argmaxMerge(warp_values[0], warp_indices[0], warp_values[other], warp_indices[other]);
+        }
+        const int partial = row * ARGMAX_CHUNKS_PER_ROW + blockIdx.x;
+        partial_values[partial] = warp_values[0];
+        partial_indices[partial] = warp_indices[0];
+    }
+}
+
+__global__ void argmaxFinalizeKernel(const float *partial_values, const int *partial_indices,
+                                     int num_rows, int *sampled_tokens)
+{
+    const int row = blockIdx.x;
+    if (row >= num_rows)
+    {
+        return;
+    }
+
+    __shared__ float values[ARGMAX_CHUNKS_PER_ROW];
+    __shared__ int indices[ARGMAX_CHUNKS_PER_ROW];
+
+    const int chunk = threadIdx.x;
+    values[chunk] = partial_values[row * ARGMAX_CHUNKS_PER_ROW + chunk];
+    indices[chunk] = partial_indices[row * ARGMAX_CHUNKS_PER_ROW + chunk];
+    __syncthreads();
+
+    // ARGMAX_CHUNKS_PER_ROW is a power of two, so the halving never leaves an odd element out
+    for (int stride = ARGMAX_CHUNKS_PER_ROW / 2; stride > 0; stride >>= 1)
+    {
+        if (chunk < stride)
+        {
+            argmaxMerge(values[chunk], indices[chunk], values[chunk + stride], indices[chunk + stride]);
+        }
+        __syncthreads();
+    }
+
+    if (chunk == 0)
+    {
+        sampled_tokens[row] = indices[0];
+    }
+}
+
+__global__ void markSampledTokensKernel(const int *sampled_tokens, const int *row_slot_ids,
+                                        int num_rows, unsigned char *penalty_mask)
+{
+    const int row = threadIdx.x;
+    if (row >= num_rows)
+    {
+        return;
+    }
+    penalty_mask[(size_t)row_slot_ids[row] * VOCAB_SIZE + sampled_tokens[row]] = 1;
+}

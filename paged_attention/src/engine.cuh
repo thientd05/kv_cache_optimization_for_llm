@@ -51,7 +51,16 @@ struct DeviceBuffers
     int *last_tokens;  // [BATCH_SIZE] token each active slot feeds back in this step
     int *active_slots; // [BATCH_SIZE] slot id of each row, for the block table walk
     int *seq_lens;     // [BATCH_SIZE] length each active sequence has reached
-    // TODO: move argmax to GPU and get rid of the CPU<->GPU tokens moves these exist for
+    // ---- sampling ----
+    // The argmax over the logits runs on the device, so all that crosses PCIe after the
+    // lm_head is one token id per row instead of a VOCAB_SIZE row of logits.
+    int *logit_row_slots;     // [BATCH_SIZE] slot owning each logits row (decode reuses active_slots)
+    float *argmax_values;     // [BATCH_SIZE, ARGMAX_CHUNKS_PER_ROW] first-pass partials
+    int *argmax_indices;      // [BATCH_SIZE, ARGMAX_CHUNKS_PER_ROW]
+    int *sampled_tokens;      // [BATCH_SIZE] the only thing the host reads back per step
+    // Repetition penalty state: one byte per (slot, token), 1 once the sequence has emitted
+    // that token. Replaces re-deriving the set from generated_tokens on the host every step.
+    unsigned char *penalty_mask; // [BATCH_SIZE, VOCAB_SIZE]
 };
 
 // Per-slot scheduler state. A slot is a decode seat: it is taken from the moment a prompt is
@@ -130,7 +139,6 @@ void enforcePageBudget(SlotState &slots, KVCacheState &kv);
 // Prompts whose combined length exceeds MAX_BATCH_TOKENS are split across several passes.
 void prefillBatch(std::vector<PrefillBatchItem> &items,
                   DeviceBuffers &buf,
-                  std::vector<__nv_bfloat16> &embed_proj_cpu,
                   const Weights &weights,
                   cublasHandle_t cublas_handle,
                   SlotState &slots,
@@ -141,7 +149,6 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
 // row per active slot. Returns how many slots were active, 0 meaning there was nothing to
 // decode and the caller should back off instead of spinning.
 int decodeStep(DeviceBuffers &buf,
-               std::vector<__nv_bfloat16> &embed_proj_cpu,
                const Weights &weights,
                cublasHandle_t cublas_handle,
                SlotState &slots,

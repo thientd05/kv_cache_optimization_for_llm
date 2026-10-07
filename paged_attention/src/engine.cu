@@ -4,7 +4,6 @@
 #include <chrono>
 #include <iostream>
 #include <numeric>
-#include <unordered_set>
 
 #define JSON_USE_IMPLICIT_CONVERSIONS 0
 #include "json.hpp"
@@ -68,6 +67,16 @@ DeviceBuffers allocateDeviceBuffers()
     buf.last_tokens = (int *)allocDevice(BATCH_SIZE * sizeof(int), "decode last tokens");
     buf.active_slots = (int *)allocDevice(BATCH_SIZE * sizeof(int), "decode active slots");
     buf.seq_lens = (int *)allocDevice(BATCH_SIZE * sizeof(int), "decode seq lens");
+
+    // Sampling scratch. The partials are tiny (31 x 128 pairs) and the penalty mask is
+    // BATCH_SIZE * VOCAB_SIZE bytes = 3.79 MiB, which is half of what the host-side logits
+    // copy it replaces used to cost in pinned-free pageable memory anyway.
+    buf.logit_row_slots = (int *)allocDevice(BATCH_SIZE * sizeof(int), "logit row slots");
+    buf.argmax_values = (float *)allocDevice(BATCH_SIZE * ARGMAX_CHUNKS_PER_ROW * sizeof(float), "argmax values");
+    buf.argmax_indices = (int *)allocDevice(BATCH_SIZE * ARGMAX_CHUNKS_PER_ROW * sizeof(int), "argmax indices");
+    buf.sampled_tokens = (int *)allocDevice(BATCH_SIZE * sizeof(int), "sampled tokens");
+    buf.penalty_mask = (unsigned char *)allocDevice((size_t)BATCH_SIZE * VOCAB_SIZE, "repetition penalty mask");
+    cudaMemset(buf.penalty_mask, 0, (size_t)BATCH_SIZE * VOCAB_SIZE);
 
     return buf;
 }
@@ -220,7 +229,6 @@ void enforcePageBudget(SlotState &slots, KVCacheState &kv)
 
 void prefillBatch(std::vector<PrefillBatchItem> &items,
                   DeviceBuffers &buf,
-                  std::vector<__nv_bfloat16> &embed_proj_cpu,
                   const Weights &weights,
                   cublasHandle_t cublas_handle,
                   SlotState &slots,
@@ -230,6 +238,14 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
     // every GEMM in prefill is a plain C = A * B
     const float alpha = 1.0f;
     const float beta = 0.0f;
+
+    // A slot is recycled between sequences, so the repetition penalty mask of every slot
+    // admitted here has to start empty - otherwise the new sequence inherits the previous
+    // tenant's token history. One VOCAB_SIZE row is 125 KiB of device memset.
+    for (const PrefillBatchItem &item : items)
+    {
+        cudaMemset(buf.penalty_mask + (size_t)item.slot * VOCAB_SIZE, 0, VOCAB_SIZE);
+    }
 
     size_t next_item = 0;
     while (next_item < items.size())
@@ -241,6 +257,7 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
         std::vector<int> token_seq_start;
         std::vector<int> token_slot_ids;
         std::vector<int> last_token_rows;
+        std::vector<int> logit_row_slots;
         std::vector<int> tile_token_begin;
         std::vector<int> tile_token_count;
         std::vector<size_t> pass_items;
@@ -261,6 +278,9 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
                 token_slot_ids.push_back(items[next_item].slot);
             }
             last_token_rows.push_back(seq_start + prompt_len - 1);
+            // row i of the logits belongs to this prompt's slot; the sampling kernels need
+            // it to find the slot's penalty mask row
+            logit_row_slots.push_back(items[next_item].slot);
             // cut this prompt into query tiles for prefillAttention; a tile never straddles
             // a prompt boundary, which is what keeps attention from looking across prompts
             for (int tile_begin = 0; tile_begin < prompt_len; tile_begin += PREFILL_ATTN_QUERIES_PER_TILE)
@@ -359,6 +379,7 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
         cudaMemcpy(buf.token_seq_start, token_seq_start.data(), num_tokens * sizeof(int), cudaMemcpyHostToDevice);
         cudaMemcpy(buf.token_slot_ids, token_slot_ids.data(), num_tokens * sizeof(int), cudaMemcpyHostToDevice);
         cudaMemcpy(buf.last_token_rows, last_token_rows.data(), num_seqs * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(buf.logit_row_slots, logit_row_slots.data(), num_seqs * sizeof(int), cudaMemcpyHostToDevice);
         cudaMemcpy(buf.tile_token_begin, tile_token_begin.data(), num_attn_tiles * sizeof(int), cudaMemcpyHostToDevice);
         cudaMemcpy(buf.tile_token_count, tile_token_count.data(), num_attn_tiles * sizeof(int), cudaMemcpyHostToDevice);
 
@@ -618,32 +639,30 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
                      CUBLAS_COMPUTE_32F,
                      CUBLAS_GEMM_DEFAULT);
 
-        cudaMemcpy(embed_proj_cpu.data(), buf.embed_proj, sizeof(__nv_bfloat16) * num_seqs * VOCAB_SIZE, cudaMemcpyDeviceToHost);
+        // Greedy sampling on the device, so the only thing that crosses PCIe is one token id
+        // per prompt. No penalty mask here: a prompt being prefilled has emitted nothing yet,
+        // which is exactly what the host-side scan did (it never applied the penalty either).
+        argmaxPartialKernel<<<dim3(ARGMAX_CHUNKS_PER_ROW, num_seqs), ARGMAX_BLOCK_THREADS>>>(
+            buf.embed_proj, num_seqs, nullptr, nullptr, buf.argmax_values, buf.argmax_indices);
+        argmaxFinalizeKernel<<<num_seqs, ARGMAX_CHUNKS_PER_ROW>>>(
+            buf.argmax_values, buf.argmax_indices, num_seqs, buf.sampled_tokens);
+        // the first generated token counts towards the repetition penalty of the steps that
+        // follow, same as when the host pushed it into generated_tokens
+        markSampledTokensKernel<<<1, BATCH_SIZE>>>(buf.sampled_tokens, buf.logit_row_slots, num_seqs, buf.penalty_mask);
+
+        std::vector<int> sampled(num_seqs);
+        cudaMemcpy(sampled.data(), buf.sampled_tokens, num_seqs * sizeof(int), cudaMemcpyDeviceToHost);
         cudaDeviceSynchronize();
 
         auto prefill_end = std::chrono::high_resolution_clock::now();
         float prefill_ms = std::chrono::duration<float, std::milli>(prefill_end - prefill_start).count();
 
-        // argmax to get the first output token of every prompt
-        // TODO: write a proper kernel for it
-        // for now just a simple CPU function
         for (int seq = 0; seq < num_seqs; ++seq)
         {
             int slot = items[pass_items[seq]].slot;
             int request_id = items[pass_items[seq]].request_id;
             int prompt_len = (int)items[pass_items[seq]].tokens.size();
-            size_t logits_offset = (size_t)seq * VOCAB_SIZE;
-
-            float max_token = (float)embed_proj_cpu[logits_offset];
-            int max_token_idx = 0;
-            for (int token_idx = 0; token_idx < VOCAB_SIZE; ++token_idx)
-            {
-                if ((float)embed_proj_cpu[logits_offset + token_idx] > max_token)
-                {
-                    max_token = (float)embed_proj_cpu[logits_offset + token_idx];
-                    max_token_idx = token_idx;
-                }
-            }
+            const int max_token_idx = sampled[seq];
 
             const bool is_eos = (max_token_idx == END_OF_TEXT_TOKEN_ID || max_token_idx == EOT_ID_TOKEN_ID);
 
@@ -691,7 +710,6 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
 
 // Advances every running sequence by one token.
 int decodeStep(DeviceBuffers &buf,
-               std::vector<__nv_bfloat16> &embed_proj_cpu,
                const Weights &weights,
                cublasHandle_t cublas_handle,
                SlotState &slots,
@@ -972,36 +990,25 @@ int decodeStep(DeviceBuffers &buf,
                  CUBLAS_COMPUTE_32F,
                  CUBLAS_GEMM_DEFAULT);
 
-    cudaMemcpy(embed_proj_cpu.data(), buf.embed_proj, sizeof(__nv_bfloat16) * num_active_slots * VOCAB_SIZE, cudaMemcpyDeviceToHost);
+    // Penalise and argmax on the device. This used to be the single most expensive
+    // host-side step of a decode iteration: a 7.58 MiB logits download, then per slot a
+    // VOCAB_SIZE bf16->float conversion into a fresh std::vector plus a serial scan, i.e.
+    // ~4M elements touched three times on one core while the GPU sat idle. buf.active_slots
+    // already holds the slot that owns each logits row, so it doubles as the mask index.
+    argmaxPartialKernel<<<dim3(ARGMAX_CHUNKS_PER_ROW, num_active_slots), ARGMAX_BLOCK_THREADS>>>(
+        buf.embed_proj, num_active_slots, buf.penalty_mask, buf.active_slots,
+        buf.argmax_values, buf.argmax_indices);
+    argmaxFinalizeKernel<<<num_active_slots, ARGMAX_CHUNKS_PER_ROW>>>(
+        buf.argmax_values, buf.argmax_indices, num_active_slots, buf.sampled_tokens);
+    markSampledTokensKernel<<<1, BATCH_SIZE>>>(buf.sampled_tokens, buf.active_slots, num_active_slots, buf.penalty_mask);
+
+    std::vector<int> sampled(num_active_slots);
+    cudaMemcpy(sampled.data(), buf.sampled_tokens, num_active_slots * sizeof(int), cudaMemcpyDeviceToHost);
 
     for (int slot = 0; slot < num_active_slots; ++slot)
     {
         int active_slot = active_slots[slot];
-        
-        std::vector<float> logits(VOCAB_SIZE);
-        for (int token_idx = 0; token_idx < VOCAB_SIZE; ++token_idx) {
-            logits[token_idx] = (float)embed_proj_cpu[slot * VOCAB_SIZE + token_idx];
-        }
-        
-        std::unordered_set<int> unique_tokens(slots.generated_tokens[active_slot].begin(), slots.generated_tokens[active_slot].end());
-        for (int prev_token : unique_tokens) {
-            if (logits[prev_token] > 0.0f) {
-                logits[prev_token] /= REPETITION_PENALTY;
-            } else {
-                logits[prev_token] *= REPETITION_PENALTY;
-            }
-        }
-
-        float max_token = -1e30f;
-        int max_token_idx = 0;
-        for (int token_idx = 0; token_idx < VOCAB_SIZE; ++token_idx)
-        {
-            if (logits[token_idx] > max_token)
-            {
-                max_token = logits[token_idx];
-                max_token_idx = token_idx;
-            }
-        }
+        const int max_token_idx = sampled[slot];
         const int request_id = slots.slot_request_id[active_slot];
         const bool is_eos = (max_token_idx == END_OF_TEXT_TOKEN_ID || max_token_idx == EOT_ID_TOKEN_ID);
 

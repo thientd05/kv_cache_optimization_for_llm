@@ -56,10 +56,6 @@ int main(int argc, char *argv[])
     KVCacheState kv = allocateKVCache();
     DeviceBuffers buffers = allocateDeviceBuffers();
 
-    // logits come back to the host for the argmax, BATCH_SIZE rows at most
-    // TODO: move argmax to GPU and this copy goes away
-    std::vector<__nv_bfloat16> embed_proj_cpu((size_t)BATCH_SIZE * VOCAB_SIZE);
-
     // Prompts arrive on stdin as "<request_id> <token> <token> ..."; the reader thread owns
     // the parsing and the scheduler only ever drains this queue.
     std::deque<Request> queue;
@@ -79,7 +75,7 @@ int main(int argc, char *argv[])
         std::vector<PrefillBatchItem> prefill_items = admitQueuedRequests(queue, slots);
         if (!prefill_items.empty())
         {
-            prefillBatch(prefill_items, buffers, embed_proj_cpu, weights, cublas_handle, slots, kv, queue);
+            prefillBatch(prefill_items, buffers, weights, cublas_handle, slots, kv, queue);
 
             // decode timings measure decode only, so restart the clock for whoever survived
             // prefill and is about to start generating
@@ -96,7 +92,7 @@ int main(int argc, char *argv[])
         // ---- make sure every running sequence can still be served this step ----
         enforcePageBudget(slots, kv);
 
-        if (decodeStep(buffers, embed_proj_cpu, weights, cublas_handle, slots, kv) == 0)
+        if (decodeStep(buffers, weights, cublas_handle, slots, kv) == 0)
         {
             // nothing running, so wait for the reader thread instead of spinning on the queue
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
