@@ -54,3 +54,6 @@ model.safetensors
 *.sqlite
 temp.txt
 temp*.md
+
+.claude/
+CLAUDE.md
