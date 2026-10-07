@@ -1,4 +1,4 @@
-#pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 accelerate==1.15.0
 annotated-doc==0.0.5
 anyio==4.15.1
@@ -44,9 +44,9 @@ setuptools==78.1.0
 shellingham==1.5.4
 sympy==1.13.1
 tokenizers==0.23.2
-torch==2.6.0+cu124
-torchaudio==2.6.0+cu124
-torchvision==0.21.0+cu124
+#torch==2.6.0+cu124
+#torchaudio==2.6.0+cu124
+#torchvision==0.21.0+cu124
 tqdm==4.70.1
 transformers==5.17.0
 triton==3.2.0
