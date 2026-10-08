@@ -218,6 +218,76 @@ __global__ void pagedAttentionKernel(int layer, int num_active_slots, __nv_bfloa
     output[active_slot * EMBEDDING_LENGTH + q_head_id * HEAD_DIM + thread_id] = acc / d;
 }
 
+__global__ void ropeDecodeBatchKernel(__nv_bfloat16 *input, int num_rows, int proj_dim,
+                                      const int *positions, const float *cos_table,
+                                      const float *sin_table)
+{
+    int row = blockIdx.x;
+    if (row >= num_rows)
+        return;
+
+    int tid = threadIdx.x;
+    int half_proj = proj_dim / 2;
+    constexpr int half_dim = HEAD_DIM / 2;
+    if (tid >= half_proj)
+        return;
+
+    int head_idx = tid / half_dim;
+    int pair_idx = tid % half_dim;
+
+    __nv_bfloat16 *row_ptr = input + (size_t)row * proj_dim;
+    int base = head_idx * HEAD_DIM;
+    int idx1 = base + pair_idx;
+    int idx2 = base + pair_idx + half_dim;
+
+    float x1 = (float)row_ptr[idx1];
+    float x2 = (float)row_ptr[idx2];
+
+    int table_idx = positions[row] * HEAD_DIM + pair_idx * 2;
+    float c = cos_table[table_idx];
+    float s = sin_table[table_idx];
+
+    row_ptr[idx1] = (__nv_bfloat16)(x1 * c - x2 * s);
+    row_ptr[idx2] = (__nv_bfloat16)(x1 * s + x2 * c);
+}
+
+__global__ void markTokenListKernel(const int *tokens, int num_tokens, int slot,
+                                    unsigned char *penalty_mask)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < num_tokens)
+    {
+        penalty_mask[(size_t)slot * VOCAB_SIZE + tokens[i]] = 1;
+    }
+}
+
+__global__ void scatterKVDecodeKernel(int layer, int num_rows, const __nv_bfloat16 *k_src,
+                                      const __nv_bfloat16 *v_src, __nv_bfloat16 *kv_cache,
+                                      const int *block_table_gpu, const int *active_slots,
+                                      const int *positions)
+{
+    int row = blockIdx.x;
+    if (row >= num_rows)
+        return;
+
+    int slot = active_slots[row];
+    int position = positions[row];
+    int logical_block_idx = position / BLOCK_SIZE;
+    int token_in_block_idx = position % BLOCK_SIZE;
+
+    int physical_block = block_table_gpu[slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx];
+    if (physical_block < 0)
+        return; // host failed to map the page, nothing sane to write
+
+    char *page = (char *)kv_cache + (size_t)physical_block * BLOCK_BYTES + (size_t)token_in_block_idx * KV_DIM * sizeof(__nv_bfloat16);
+    __nv_bfloat16 *k_dst = (__nv_bfloat16 *)page;
+    __nv_bfloat16 *v_dst = (__nv_bfloat16 *)(page + V_OFFSET);
+
+    size_t src = (size_t)row * KV_DIM + threadIdx.x;
+    k_dst[threadIdx.x] = k_src[src];
+    v_dst[threadIdx.x] = v_src[src];
+}
+
 // ---- batched ("packed") prefill ----
 
 __global__ void embeddingGatherKernel(int *gpu_input_tokens, __nv_bfloat16 *gpu_input_embeds, __nv_bfloat16 *embed_tokens, int num_input_tokens)

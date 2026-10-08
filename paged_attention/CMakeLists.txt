@@ -34,6 +34,15 @@ add_executable(tiny-vllm
 target_include_directories(tiny-vllm PRIVATE src)
 target_include_directories(tiny-vllm PRIVATE include)
 
+# Knobs for the §7.2 block-size ablation. sweep.py rebuilds with -DABLATION_BLOCK_SIZE=N;
+# nothing else ever sets them, so a normal build is unaffected.
+if(DEFINED ABLATION_BLOCK_SIZE)
+    target_compile_definitions(tiny-vllm PRIVATE ABLATION_BLOCK_SIZE=${ABLATION_BLOCK_SIZE})
+endif()
+if(DEFINED ABLATION_MAX_SEQUENCES)
+    target_compile_definitions(tiny-vllm PRIVATE ABLATION_MAX_SEQUENCES=${ABLATION_MAX_SEQUENCES})
+endif()
+
 target_link_libraries(tiny-vllm PRIVATE
     CUDA::cublas
     CUDA::cudart

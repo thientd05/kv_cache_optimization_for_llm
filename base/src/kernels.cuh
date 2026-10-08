@@ -99,13 +99,6 @@ __global__ void scatterKVDecodeKernel(int layer, int num_rows, const __nv_bfloat
                                       const int *kv_slot_base, const int *kv_slot_cap,
                                       const int *active_slots, const int *positions);
 
-// <<<ceil(num_tokens / 256), 256>>>
-// Marks a whole list of token ids in one slot's repetition-penalty mask row. Only a
-// preempted sequence needs this: recomputation replays its prompt and its already-generated
-// tokens through prefill, and the mask has to come back with it or the sequence would
-// resume with a different penalty state than it was preempted with.
-__global__ void markTokenListKernel(const int *tokens, int num_tokens, int slot,
-                                    unsigned char *penalty_mask);
 
 // ---- sampling ----
 //

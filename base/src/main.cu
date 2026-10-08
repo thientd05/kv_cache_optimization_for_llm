@@ -84,10 +84,12 @@ int main(int argc, char *argv[])
     // RoPE cos/sin tables, precomputed once for every position up to MAX_SEQ_LEN
     initRopeFrequencies();
 
-    KVCacheState kv = allocateKVCache();
+    // Order matters: the KV cache is sized from whatever VRAM is left, so every other
+    // allocation has to be in place before it asks. See allocateKVCache().
     DeviceBuffers buffers = allocateDeviceBuffers();
+    KVCacheState kv = allocateKVCache();
 
-    // Prompts arrive on stdin as "<request_id> <token> <token> ..."; the reader thread owns
+    // Prompts arrive on stdin as "<request_id> <max_tokens> <token> <token> ..."; the reader thread owns
     // the parsing and the scheduler only ever drains this queue.
     std::deque<Request> queue;
     std::thread in_thread(input_thread_func, std::ref(queue));

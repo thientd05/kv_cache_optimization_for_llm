@@ -35,6 +35,9 @@ STALL_TIMEOUT_S = float(os.environ.get("STALL_TIMEOUT_S", "120"))
 USAGE = f"usage: {os.path.basename(sys.argv[0])} [number of prompts to run]"
 PROMPTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts.txt")
 
+# MAX_NEW_TOKENS_GENERATED in src/config.h (shared block); the per-request budget this harness asks for.
+MAX_NEW_TOKENS = 1024
+
 # Argument and file are both checked before anything expensive happens, so a typo fails now
 # rather than after the tokenizer and 2.30 GiB of weights have been loaded.
 if len(sys.argv) > 2:
@@ -220,7 +223,12 @@ def read_engine_output():
                 continue
             entry["last_update"] = time.monotonic()
 
-            if data.get("type") == "prefill_stats":
+            if data.get("type") == "preempted":
+                # The engine took this sequence's KV pages back and re-queued it; it will
+                # be prefilled again and carry on. Not a token and not a completion, so
+                # the bare-{id, slot} branch below must not see it.
+                entry["state"] = STATE_QUEUED
+            elif data.get("type") == "prefill_stats":
                 entry["prefill"] = data
                 if entry["state"] == STATE_QUEUED:
                     entry["state"] = STATE_DECODE
@@ -279,8 +287,11 @@ def submit_all():
             entry = new_request(p)
             with _state_lock:
                 batch.append(entry)
-            # one line per request: "<id> <token> <token> ..."
-            engine.stdin.write(f"{entry['id']} " + " ".join(map(str, tokens)) + "\n")
+            # one line per request: "<id> <max_tokens> <token> <token> ..."
+            # The output budget is per request on the wire now (see request_queue.h); this
+            # harness is the interactive one, so it just asks for the engine's full cap.
+            # bench.py is the thing that varies it.
+            engine.stdin.write(f"{entry['id']} {MAX_NEW_TOKENS} " + " ".join(map(str, tokens)) + "\n")
             engine.stdin.flush()
             _progress.set()
     except (BrokenPipeError, OSError) as exc:

@@ -74,6 +74,34 @@ __global__ void embeddingGatherDecodeKernel(int *gpu_last_tokens, int num_tokens
 __global__ void ropeDecodeKernel(__nv_bfloat16 *input, int position_in_sequence, int proj_dim,
                                  const float *cos_table, const float *sin_table);
 
+// <<<num_rows, proj_dim / 2>>>, proj_dim / 2 must not exceed MAX_THREADS_PER_BLOCK
+// The batched form of ropeDecodeKernel: one launch rotates every active slot's row instead
+// of one launch per slot. The per-slot form cost 2 * num_slots * N_LAYERS launches a step -
+// ~1000 at 31 slots, ~12000 at 384 - and none of that has anything to do with paging, so the
+// shape of the comparison must not depend on it. Identical to the baseline's copy.
+__global__ void ropeDecodeBatchKernel(__nv_bfloat16 *input, int num_rows, int proj_dim,
+                                      const int *positions, const float *cos_table,
+                                      const float *sin_table);
+
+// <<<num_rows, KV_DIM>>>
+// Writes one decoded token's K and V per active slot into its page, in a single launch,
+// replacing the 2 * num_rows cudaMemcpy pair the decode loop used to issue per layer (992
+// memcpys a step at 31 slots, 12288 at 384). The pages must already be mapped in
+// block_table_gpu by the host - allocating one is a host decision, so decodeStep does it for
+// every slot that crosses a block boundary before the layer loop starts.
+__global__ void scatterKVDecodeKernel(int layer, int num_rows, const __nv_bfloat16 *k_src,
+                                      const __nv_bfloat16 *v_src, __nv_bfloat16 *kv_cache,
+                                      const int *block_table_gpu, const int *active_slots,
+                                      const int *positions);
+
+// <<<ceil(num_tokens / 256), 256>>>
+// Marks a whole list of token ids in one slot's repetition-penalty mask row. Only a
+// preempted sequence needs this: recomputation replays its prompt and its already-generated
+// tokens through prefill, and the mask has to come back with it or the sequence would
+// resume with a different penalty state than it was preempted with.
+__global__ void markTokenListKernel(const int *tokens, int num_tokens, int slot,
+                                    unsigned char *penalty_mask);
+
 // <<<dim3(num_active_slots, NUM_Q_HEADS), HEAD_DIM>>>
 __global__ void pagedAttentionKernel(int layer, int num_active_slots, __nv_bfloat16 *q_proj,
                                      __nv_bfloat16 *kv_cache, int *block_table_gpu, int *gpu_seq_lens,

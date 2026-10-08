@@ -1,6 +1,7 @@
 #include "engine.cuh"
 
 #include <cassert>
+#include <cstdlib>
 #include <chrono>
 #include <iostream>
 
@@ -109,79 +110,201 @@ DeviceBuffers allocateDeviceBuffers()
     return buf;
 }
 
+int g_kv_pool_tokens = 0;
+
+// ---- binary buddy allocator over the token-slot pool ----
+// The paper's Orca "uses the buddy allocation algorithm to determine the memory address to store
+// KV cache", so this is what the baseline must use. A plain first-fit free list with coalescing -
+// what this code used to do - is a *stronger* allocator than the paper's baseline: it rounds to a
+// 16-token granularity instead of to a power of two, and it fragments less. Using it would have
+// flattered the baseline against the paper's own description of it.
+
+static int ceilLog2(int n)
+{
+    int order = 0;
+    while ((1 << order) < n)
+    {
+        ++order;
+    }
+    return order;
+}
+
+// Places every self-aligned power-of-two run that lies entirely inside the real pool into its
+// free list. The pool is viewed as one buddy tree over the next power of two above its size; the
+// straddling and past-the-end parts are simply never made free, which is what keeps them from
+// ever being allocated or merged into without any extra bookkeeping.
+static void buddyInitRange(KVCacheState &kv, int start, int order, int pool_tokens)
+{
+    if (start >= pool_tokens)
+    {
+        return; // past the end of real memory: not a block, never free
+    }
+    const int size = 1 << order;
+    if (start + size <= pool_tokens)
+    {
+        kv.free_lists[order].push_back(start);
+        return; // fully inside the pool
+    }
+    if (order == 0)
+    {
+        return;
+    }
+    buddyInitRange(kv, start, order - 1, pool_tokens);
+    buddyInitRange(kv, start + size / 2, order - 1, pool_tokens);
+}
+
+static void buddyInit(KVCacheState &kv)
+{
+    int root_order = ceilLog2(g_kv_pool_tokens);
+    if (root_order > KV_MAX_ORDER)
+    {
+        std::cerr << "KV pool of " << g_kv_pool_tokens << " tokens exceeds KV_MAX_ORDER\n";
+        std::exit(1);
+    }
+    buddyInitRange(kv, 0, root_order, g_kv_pool_tokens);
+}
+
+// Smallest free run of at least 2^want_order slots, split down to exactly that order.
+// Returns -1 if no run of that order can be formed, which is the external-fragmentation case.
+static int buddyAlloc(KVCacheState &kv, int want_order)
+{
+    int k = want_order;
+    while (k <= KV_MAX_ORDER && kv.free_lists[k].empty())
+    {
+        ++k;
+    }
+    if (k > KV_MAX_ORDER)
+    {
+        return -1;
+    }
+    int start = kv.free_lists[k].back();
+    kv.free_lists[k].pop_back();
+    // split the surplus half away, order by order, keeping the lower half
+    while (k > want_order)
+    {
+        --k;
+        kv.free_lists[k].push_back(start + (1 << k));
+    }
+    return start;
+}
+
+static void buddyFree(KVCacheState &kv, int start, int order)
+{
+    while (order < KV_MAX_ORDER)
+    {
+        const int buddy = start ^ (1 << order);
+        auto &list = kv.free_lists[order];
+        auto it = std::find(list.begin(), list.end(), buddy);
+        if (it == list.end())
+        {
+            break; // buddy is in use, straddles the end of the pool, or is past it: no merge
+        }
+        list.erase(it);
+        start = std::min(start, buddy);
+        ++order;
+    }
+    kv.free_lists[order].push_back(start);
+}
+
+
 KVCacheState allocateKVCache()
 {
-    // One slab of KV_POOL_TOKENS token slots - the same 1000 MiB the paged build cuts into
-    // 32000 pages - plus a free list that starts as a single run covering all of it.
+    // One slab of token slots plus a free list that starts as a single run covering all of it.
+    //
+    // The size is not chosen, it is whatever is left. In the paper both systems run the same model
+    // on the same GPU, so the VRAM that remains once the weights and the activations are allocated
+    // becomes the KV cache, identically on both sides - "how many MiB does each side get" is not a
+    // question that exists there. Hardcoding it here is how the two builds silently drifted to
+    // 768 MiB and 1000 MiB, a 30% gap in the one resource the comparison is about. So: allocate
+    // everything else first (see main.cu), then claim what is free minus a margin.
+    size_t free_mem = 0;
+    size_t total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    if (free_mem <= KV_SAFETY_MARGIN_BYTES)
+    {
+        std::cerr << "Only " << free_mem / B_TO_MB << " MiB of VRAM free, which does not cover the "
+                  << KV_SAFETY_MARGIN_BYTES / B_TO_MB << " MiB safety margin\n";
+        std::exit(1);
+    }
+    size_t kv_bytes = free_mem - KV_SAFETY_MARGIN_BYTES;
+    g_kv_pool_tokens = (int)(kv_bytes / KV_BYTES_PER_TOKEN);
+    if (g_kv_pool_tokens < MAX_TOKENS_PER_SEQUENCE)
+    {
+        std::cerr << "KV pool holds " << g_kv_pool_tokens << " tokens, too small for even one "
+                  << MAX_TOKENS_PER_SEQUENCE << "-token sequence\n";
+        std::exit(1);
+    }
+    std::cerr << "KV pool: " << (size_t)g_kv_pool_tokens * KV_BYTES_PER_TOKEN / B_TO_MB << " MiB = "
+              << g_kv_pool_tokens << " tokens of context\n";
+
     KVCacheState kv{};
-    kv.cache = (__nv_bfloat16 *)allocDevice((size_t)KV_POOL_TOKENS * KV_BYTES_PER_TOKEN, "KV cache");
-    kv.free_runs.push_back({0, KV_POOL_TOKENS});
+    kv.cache = (__nv_bfloat16 *)allocDevice((size_t)g_kv_pool_tokens * KV_BYTES_PER_TOKEN, "KV cache");
+    kv.free_lists.assign(KV_MAX_ORDER + 1, {});
+    buddyInit(kv);
     kv.slot_base.assign(MAX_SEQUENCES, -1);
     kv.slot_cap.assign(MAX_SEQUENCES, 0);
     kv.slot_base_gpu = (int *)allocDevice(MAX_SEQUENCES * sizeof(int), "slot bases");
     kv.slot_cap_gpu = (int *)allocDevice(MAX_SEQUENCES * sizeof(int), "slot caps");
     kv.reserved_tokens = 0;
+    kv.free_tokens = g_kv_pool_tokens;
     kv.fragmentation_failures = 0;
     return kv;
 }
 
 int reservationTokens(int prompt_len, int max_tokens)
 {
-    int final_len = prompt_len + max_tokens;
-    int reserved = final_len;
+    // The paper's §6.1 wording decides all three of these, and the previous implementation got
+    // all three slightly wrong - two of them in the baseline's favour.
     if (g_reserve_policy == ReservePolicy::Max)
     {
-        // The only honest policy for a system that cannot see the future: a request may
-        // generate up to its budget, and the region cannot grow, so it gets the cap.
-        reserved = MAX_TOKENS_PER_SEQUENCE;
+        // "always reserves the space up to the maximum sequence length of the model, i.e. 2048
+        // tokens". It used to reserve MAX_TOKENS_PER_SEQUENCE, which is only the same number
+        // because the generation limits now add up to MAX_SEQ_LEN.
+        return MAX_SEQ_LEN;
     }
-    else if (g_reserve_policy == ReservePolicy::Pow2)
+    if (g_reserve_policy == ReservePolicy::Pow2)
     {
+        // "over-reserves the space for outputs by at most 2x. For example, if the true output
+        // length is 25, it reserves 32 positions for outputs." The rounding is on the OUTPUT and
+        // the prompt is added on top. It used to round the total, which for a 40-token prompt and
+        // a 25-token output reserved 128 instead of 72 - nearly twice the paper's figure.
         int p = 1;
-        while (p < final_len)
+        while (p < max_tokens)
         {
             p *= 2;
         }
-        reserved = p;
+        int reserved = prompt_len + p;
+        return std::min(reserved, MAX_SEQ_LEN);
     }
-    if (reserved > MAX_TOKENS_PER_SEQUENCE)
-    {
-        reserved = MAX_TOKENS_PER_SEQUENCE;
-    }
-    return ((reserved + KV_ALLOC_GRANULARITY - 1) / KV_ALLOC_GRANULARITY) * KV_ALLOC_GRANULARITY;
+    // Oracle: "the system has the knowledge of the lengths of the outputs that will be actually
+    // generated", so exactly what the sequence will need and not a token more. No rounding here -
+    // the buddy allocator applies its own, which is the paper's model of Orca.
+    return std::min(prompt_len + max_tokens, MAX_SEQ_LEN);
 }
 
 bool kvReserve(KVCacheState &kv, int slot, int tokens)
 {
-    for (size_t i = 0; i < kv.free_runs.size(); ++i)
+    const int order = ceilLog2(tokens);
+    const int size = 1 << order;
+    const int start = buddyAlloc(kv, order);
+    if (start < 0)
     {
-        if (kv.free_runs[i].length < tokens)
+        // Enough free total but no aligned run of this order: contiguity itself is what failed.
+        // Worth counting separately from "the pool is simply full", because paging has no such
+        // failure mode - any free page fits any sequence.
+        if (kv.free_tokens >= size)
         {
-            continue;
+            ++kv.fragmentation_failures;
         }
-        kv.slot_base[slot] = kv.free_runs[i].start;
-        kv.slot_cap[slot] = tokens;
-        kv.free_runs[i].start += tokens;
-        kv.free_runs[i].length -= tokens;
-        if (kv.free_runs[i].length == 0)
-        {
-            kv.free_runs.erase(kv.free_runs.begin() + i);
-        }
-        kv.reserved_tokens += tokens;
-        return true;
+        return false;
     }
-    // Enough free total but no single run big enough: contiguity itself is the thing that
-    // failed. Worth counting separately from "the pool is simply full".
-    int free_total = 0;
-    for (const KVFreeRun &run : kv.free_runs)
-    {
-        free_total += run.length;
-    }
-    if (free_total >= tokens)
-    {
-        ++kv.fragmentation_failures;
-    }
-    return false;
+    kv.slot_base[slot] = start;
+    // The run really is `size` long, not `tokens`: the gap is buddy's rounding, and charging the
+    // sequence for it is the point. kvKOffset uses the cap to find V, so it must be the true size.
+    kv.slot_cap[slot] = size;
+    kv.reserved_tokens += size;
+    kv.free_tokens -= size;
+    return true;
 }
 
 void kvRelease(KVCacheState &kv, int slot)
@@ -190,29 +313,12 @@ void kvRelease(KVCacheState &kv, int slot)
     {
         return;
     }
-    KVFreeRun freed{kv.slot_base[slot], kv.slot_cap[slot]};
-    kv.reserved_tokens -= kv.slot_cap[slot];
+    const int size = kv.slot_cap[slot];
+    buddyFree(kv, kv.slot_base[slot], ceilLog2(size));
+    kv.reserved_tokens -= size;
+    kv.free_tokens += size;
     kv.slot_base[slot] = -1;
     kv.slot_cap[slot] = 0;
-
-    size_t at = 0;
-    while (at < kv.free_runs.size() && kv.free_runs[at].start < freed.start)
-    {
-        ++at;
-    }
-    kv.free_runs.insert(kv.free_runs.begin() + at, freed);
-    // coalesce with the run after, then with the run before
-    if (at + 1 < kv.free_runs.size() &&
-        kv.free_runs[at].start + kv.free_runs[at].length == kv.free_runs[at + 1].start)
-    {
-        kv.free_runs[at].length += kv.free_runs[at + 1].length;
-        kv.free_runs.erase(kv.free_runs.begin() + at + 1);
-    }
-    if (at > 0 && kv.free_runs[at - 1].start + kv.free_runs[at - 1].length == kv.free_runs[at].start)
-    {
-        kv.free_runs[at - 1].length += kv.free_runs[at].length;
-        kv.free_runs.erase(kv.free_runs.begin() + at);
-    }
 }
 
 void kvSyncSlotTables(const KVCacheState &kv)
@@ -235,11 +341,13 @@ void reportEngineConfig()
     // BATCH_SIZE is derived, so the client cannot hardcode it
     json config_j;
     config_j["type"] = "engine_config";
+    config_j["mechanism"] = "contiguous";
     config_j["batch_size"] = BATCH_SIZE;
     config_j["max_batch_tokens"] = MAX_BATCH_TOKENS;
     config_j["max_prompt_len"] = MAX_PROMPT_LEN;
+    config_j["max_new_tokens"] = MAX_NEW_TOKENS_GENERATED;
     config_j["reserve_policy"] = reservePolicyName();
-    config_j["kv_pool_tokens"] = KV_POOL_TOKENS;
+    config_j["kv_pool_tokens"] = g_kv_pool_tokens;
     std::cout << config_j.dump() << "\n" << std::flush;
 }
 
@@ -352,7 +460,7 @@ void emitStepTelemetry(const SlotState &slots, const KVCacheState &kv, const std
     // between them is reservation the sequence has not reached yet and may never reach.
     t["kv_tokens_reserved"] = kv.reserved_tokens;
     t["kv_tokens_live"] = live_tokens;
-    t["kv_tokens_total"] = KV_POOL_TOKENS;
+    t["kv_tokens_total"] = g_kv_pool_tokens;
     t["fragmentation_failures"] = kv.fragmentation_failures;
     std::cout << t.dump() << "\n" << std::flush;
 }

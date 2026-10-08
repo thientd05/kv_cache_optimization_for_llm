@@ -81,13 +81,9 @@ struct SlotState
     SlotState();
 };
 
-// One free run of the contiguous pool: `length` token slots starting at `start`, where a
-// "token slot" is the 32 KiB that one token of context costs across all 16 layers.
-struct KVFreeRun
-{
-    int start;
-    int length;
-};
+// Largest buddy order the allocator can hand out, i.e. log2 of the biggest run. A reservation
+// never exceeds MAX_SEQ_LEN tokens, so orders above that are only ever used while splitting.
+constexpr int KV_MAX_ORDER = 20; // 2^20 token slots = 32 GiB of cache, far past any real pool
 
 // The contiguous KV cache and the reservation allocator over it. A sequence gets one run of
 // consecutive token slots at admission, sized by the reservation policy, and keeps it until
@@ -95,24 +91,36 @@ struct KVFreeRun
 // constraint is the baseline, and everything the paged build does differently follows from
 // not having it.
 //
-// The free list is kept sorted and coalesced, so a slot's run is as contiguous as the pool
-// allows. When a reservation fails even though the free *total* would cover it, the pool is
-// externally fragmented: another cost of contiguity that paging does not have, and one the
-// engine counts rather than hides.
+// The allocator is a **binary buddy allocator**, because that is what the paper assumes of Orca:
+// "We assume Orca uses the buddy allocation algorithm to determine the memory address to store
+// KV cache." Two consequences, and both of them are the measurement rather than a flaw:
+//
+//   * every reservation is rounded up to a power of two, so a 940-token sequence occupies 1024
+//     token slots. That is internal fragmentation the paged build does not have - its pages round
+//     to 16 tokens, not to the next power of two.
+//   * a reservation can fail while the free *total* would have covered it, because no single
+//     aligned run of the right order is left. That is external fragmentation, which paging does
+//     not have at all, and the engine counts it instead of hiding it.
+//
+// free_lists[k] holds the start offsets of free, self-aligned runs of 2^k token slots. The pool
+// is treated as one buddy tree over the next power of two above it, with the part past the end of
+// real memory simply never placed in a free list - so it can never be allocated and can never be
+// merged into. See buddyInit().
 struct KVCacheState
 {
-    __nv_bfloat16 *cache;             // KV_POOL_TOKENS token slots' worth of K and V
-    std::vector<KVFreeRun> free_runs; // sorted by start, coalesced
+    __nv_bfloat16 *cache;             // g_kv_pool_tokens token slots' worth of K and V
+    std::vector<std::vector<int>> free_lists; // [KV_MAX_ORDER + 1], free run starts by order
     std::vector<int> slot_base;       // [MAX_SEQUENCES] first token slot of the run, -1 if none
-    std::vector<int> slot_cap;        // [MAX_SEQUENCES] how many token slots long it is
+    std::vector<int> slot_cap;        // [MAX_SEQUENCES] how many token slots long it is (a power of two)
     int *slot_base_gpu;               // device mirrors, read by the attention and scatter kernels
     int *slot_cap_gpu;
-    int reserved_tokens;              // sum of slot_cap over live slots
+    int reserved_tokens;              // sum of slot_cap over live slots, i.e. including the rounding
+    int free_tokens;                  // real token slots not handed out
     long long fragmentation_failures; // reservations the free total could cover but no single run could
 };
 
-// Reservation size for a request under the active policy, rounded up to
-// KV_ALLOC_GRANULARITY. `final_len` is prompt + the request's output budget.
+// Reservation size for a request under the active policy, in tokens and *before* the allocator
+// rounds it up to a power of two. `max_tokens` is the request's output budget.
 int reservationTokens(int prompt_len, int max_tokens);
 
 // First-fit allocation of `tokens` consecutive token slots to `slot`. Returns false if the

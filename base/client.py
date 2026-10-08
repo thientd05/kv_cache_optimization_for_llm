@@ -35,8 +35,8 @@ STALL_TIMEOUT_S = float(os.environ.get("STALL_TIMEOUT_S", "120"))
 USAGE = f"usage: {os.path.basename(sys.argv[0])} [number of prompts to run]"
 PROMPTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts.txt")
 
-# MAX_NEW_TOKENS_GENERATED in config.h; the per-request budget this harness asks for.
-MAX_NEW_TOKENS = 512
+# MAX_NEW_TOKENS_GENERATED in src/config.h (shared block); the per-request budget this harness asks for.
+MAX_NEW_TOKENS = 1024
 
 # Argument and file are both checked before anything expensive happens, so a typo fails now
 # rather than after the tokenizer and 2.30 GiB of weights have been loaded.

@@ -257,16 +257,6 @@ __global__ void ropeDecodeBatchKernel(__nv_bfloat16 *input, int num_rows, int pr
     row_ptr[idx2] = (__nv_bfloat16)(x1 * s + x2 * c);
 }
 
-__global__ void markTokenListKernel(const int *tokens, int num_tokens, int slot,
-                                    unsigned char *penalty_mask)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < num_tokens)
-    {
-        penalty_mask[(size_t)slot * VOCAB_SIZE + tokens[i]] = 1;
-    }
-}
-
 __global__ void scatterKVDecodeKernel(int layer, int num_rows, const __nv_bfloat16 *k_src,
                                       const __nv_bfloat16 *v_src, __nv_bfloat16 *kv_cache,
                                       const int *kv_slot_base, const int *kv_slot_cap,

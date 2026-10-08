@@ -57,3 +57,5 @@ temp*.md
 
 .claude/
 CLAUDE.md
+results/
+workloads/

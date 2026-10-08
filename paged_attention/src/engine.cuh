@@ -18,6 +18,8 @@ struct PrefillBatchItem
 {
     int slot;
     int request_id;
+    int max_tokens;     // output budget still owed to this request
+    int resumed_tokens; // non-zero only for a sequence being recomputed after preemption
     std::vector<int> tokens;
 };
 
@@ -73,6 +75,14 @@ struct SlotState
     std::vector<int> last_generated_tokens;           // token to feed back in the next step
     std::vector<int> current_prompt_len;              // tokens already in the KV cache
     std::vector<int> slot_request_id;                 // which request owns the slot, -1 if none
+    std::vector<int> remaining_budget;                // output tokens the request may still get
+    // The prompt as it arrived, kept for the whole sequence's life. A preempted sequence is
+    // recomputed from prompt + what it had already generated, so the prompt has to survive the
+    // prefill that consumed it. The baseline never needs this: a reservation cannot be taken away.
+    std::vector<std::vector<int>> prompt_tokens;
+    // True while this slot holds a sequence that was preempted and readmitted, so finishSequence
+    // knows when the last one has drained and admission may reopen. See kv.preemption_pending.
+    std::vector<bool> was_preempted;
     std::vector<std::chrono::high_resolution_clock::time_point> decode_start;
 
     SlotState();
@@ -87,7 +97,31 @@ struct KVCacheState
     std::vector<int> block_table;  // [MAX_SEQUENCES * N_LAYERS * MAX_BLOCKS_PER_SEQ], -1 = unmapped
     int *block_table_gpu;          // device mirror of block_table
     std::vector<int> free_blocks;  // physical pages nobody holds
+    long long preemptions;         // sequences sent back for recomputation
+    // True from the moment a sequence is preempted until every preempted sequence has finished.
+    // §4.5: "Once it preempts a sequence and evicts its blocks, vLLM stops accepting new requests
+    // until all preempted sequences are completed." Without it, the sequence that was just
+    // readmitted is the newest one again and gets preempted straight back out - thrashing, and the
+    // latency numbers would measure that loop instead of paging.
+    bool preemption_pending;
+    int preempted_in_flight;       // how many are still working their way back out
 };
+
+// Takes a running sequence's pages back and returns it to the front of the queue to be recomputed
+// from prompt + the tokens it had already generated. §4.5: "we simply recompute the KV cache when
+// the preempted sequences are rescheduled... their KV cache at all positions can be generated in
+// one prompt phase iteration." Front of the queue because scheduling is FCFS and this request
+// arrived before anything still waiting.
+void preemptSequence(int slot, SlotState &slots, KVCacheState &kv, std::deque<Request> &queue);
+
+// How many requests are batched right now, how much of the pool is mapped, and how much of what
+// is mapped holds a real token. One JSON line every STEP_TELEMETRY_EVERY decode steps; the
+// benchmark turns them into the paper's "batched requests over time" and "KV cache utilisation"
+// curves. Same field names as the baseline build so one parser reads both.
+void emitStepTelemetry(const SlotState &slots, const KVCacheState &kv, const std::deque<Request> &queue);
+
+// Set from the IGNORE_EOS environment variable; see engine.cu.
+extern bool g_ignore_eos;
 
 // ---- startup ----
 
@@ -102,7 +136,13 @@ void reportEngineConfig();
 
 // Takes prompts off the queue into every free slot. The returned items still have to be
 // prefilled; their slots are already marked taken.
-std::vector<PrefillBatchItem> admitQueuedRequests(std::deque<Request> &queue, SlotState &slots);
+// Admission only has to cover the *prompt*: pages for the generated tokens are taken one at a
+// time as decode produces them, and the pool is deliberately over-subscribed. That is the whole
+// point of paging, and it is the one place this build differs from the baseline in kind rather
+// than in addressing - over there a prompt cannot be admitted unless its entire worst-case
+// lifetime reservation fits right now.
+std::vector<PrefillBatchItem> admitQueuedRequests(std::deque<Request> &queue, SlotState &slots,
+                                                  KVCacheState &kv);
 
 // The single place a sequence is retired. Emitting the final message, handing the slot back
 // and returning the sequence's pages used to be open-coded in the decode loop, and the
@@ -118,7 +158,7 @@ void finishSequence(int slot, int request_id, const char *error, SlotState &slot
 // indexes block_table at seq_len / BLOCK_SIZE with no bound check, both of which hold only
 // as long as the page budget does; checking here, before any of the forward pass has run,
 // means such a sequence is retired cleanly instead of taking the whole batch down with it.
-void enforcePageBudget(SlotState &slots, KVCacheState &kv);
+void enforcePageBudget(SlotState &slots, KVCacheState &kv, std::deque<Request> &queue);
 
 // Prefills every admitted prompt in one pass over the model instead of one pass per prompt.
 //

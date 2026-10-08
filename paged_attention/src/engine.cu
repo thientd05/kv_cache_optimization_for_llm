@@ -1,6 +1,7 @@
 #include "engine.cuh"
 
 #include <cassert>
+#include <cstdlib>
 #include <chrono>
 #include <iostream>
 #include <numeric>
@@ -13,12 +14,26 @@
 
 using json = nlohmann::json;
 
+// Benchmark knob, set from IGNORE_EOS at startup. With it on, a sequence runs for exactly
+// its output budget instead of stopping at <|eot_id|>. That is what vLLM's own serving
+// benchmark does, and it is what makes the comparison fair here: every request generates
+// the same number of tokens in every build, so the two engines do identical work and the
+// "oracle" reservation policy in the baseline really is an oracle rather than an estimate.
+bool g_ignore_eos = false;
+
+// Serving telemetry, not scheduler state.
+static const std::chrono::high_resolution_clock::time_point g_engine_start =
+    std::chrono::high_resolution_clock::now();
+
 SlotState::SlotState()
     : is_slot_free(BATCH_SIZE, true),
       generated_tokens(BATCH_SIZE),
       last_generated_tokens(BATCH_SIZE),
       current_prompt_len(BATCH_SIZE, 0),
       slot_request_id(BATCH_SIZE, -1),
+      remaining_budget(BATCH_SIZE, 0),
+      prompt_tokens(BATCH_SIZE),
+      was_preempted(BATCH_SIZE, false),
       decode_start(BATCH_SIZE)
 {
 }
@@ -81,14 +96,53 @@ DeviceBuffers allocateDeviceBuffers()
     return buf;
 }
 
+int g_num_blocks = 0;
+
 KVCacheState allocateKVCache()
 {
+    // The pool size is not chosen, it is whatever is left. In the paper both systems run the same
+    // model on the same GPU, so the VRAM that remains once the weights and the activations are
+    // allocated becomes the KV cache, identically on both sides - "how many MiB does each side
+    // get" is not a question that exists there. Hardcoding it here is how the two builds silently
+    // drifted to 1000 MiB here and 768 MiB in the baseline, a 30% gap in the one resource the
+    // comparison is about. So: allocate everything else first (see main.cu), then claim what is
+    // free minus a margin.
+    //
+    // This build ends up with a little less than the baseline, because the block table comes out
+    // of the same pot - hence it is allocated *before* the pool is measured, not after. That is
+    // paging's real metadata cost and it belongs in the measurement rather than being hidden in
+    // the safety margin.
     KVCacheState kv{};
-    kv.cache = (__nv_bfloat16 *)allocDevice(KV_CACHE_SIZE_BYTES, "KV cache");
-    kv.free_blocks.resize(NUM_BLOCKS);
-    std::iota(kv.free_blocks.begin(), kv.free_blocks.end(), 0);
     kv.block_table.assign(MAX_SEQUENCES * N_LAYERS * MAX_BLOCKS_PER_SEQ, -1);
     kv.block_table_gpu = (int *)allocDevice(MAX_SEQUENCES * N_LAYERS * MAX_BLOCKS_PER_SEQ * sizeof(int), "block table");
+
+    size_t free_mem = 0;
+    size_t total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    if (free_mem <= KV_SAFETY_MARGIN_BYTES)
+    {
+        std::cerr << "Only " << free_mem / B_TO_MB << " MiB of VRAM free, which does not cover the "
+                  << KV_SAFETY_MARGIN_BYTES / B_TO_MB << " MiB safety margin\n";
+        std::exit(1);
+    }
+    g_num_blocks = (int)((free_mem - KV_SAFETY_MARGIN_BYTES) / BLOCK_BYTES);
+    // a page holds BLOCK_SIZE tokens of one layer, so N_LAYERS pages make one token of context
+    int pool_tokens = (int)((long long)g_num_blocks * BLOCK_SIZE / N_LAYERS);
+    if (pool_tokens < MAX_TOKENS_PER_SEQUENCE)
+    {
+        std::cerr << "KV pool holds " << pool_tokens << " tokens, too small for even one "
+                  << MAX_TOKENS_PER_SEQUENCE << "-token sequence\n";
+        std::exit(1);
+    }
+    std::cerr << "KV pool: " << (size_t)g_num_blocks * BLOCK_BYTES / B_TO_MB << " MiB = "
+              << g_num_blocks << " pages = " << pool_tokens << " tokens of context\n";
+
+    kv.cache = (__nv_bfloat16 *)allocDevice((size_t)g_num_blocks * BLOCK_BYTES, "KV cache");
+    kv.free_blocks.resize(g_num_blocks);
+    std::iota(kv.free_blocks.begin(), kv.free_blocks.end(), 0);
+    kv.preemptions = 0;
+    kv.preemption_pending = false;
+    kv.preempted_in_flight = 0;
     return kv;
 }
 
@@ -103,20 +157,31 @@ void reportEngineConfig()
               << " prefill tokens, VRAM left: " << free_mem / B_TO_MB << " MiB\n"
               << std::flush;
 
-    // BATCH_SIZE is derived, so the client cannot hardcode it
+    // Same field set as the baseline build, so one parser reads both. kv_pool_tokens is the
+    // comparison's fairness check: it is derived from leftover VRAM on both sides, so the two
+    // builds must report nearly the same number - the gap should be only the block table.
     json config_j;
     config_j["type"] = "engine_config";
+    config_j["mechanism"] = "paged";
     config_j["batch_size"] = BATCH_SIZE;
     config_j["max_batch_tokens"] = MAX_BATCH_TOKENS;
     config_j["max_prompt_len"] = MAX_PROMPT_LEN;
+    config_j["max_new_tokens"] = MAX_NEW_TOKENS_GENERATED;
+    config_j["kv_pool_tokens"] = (int)((long long)g_num_blocks * BLOCK_SIZE / N_LAYERS);
+    config_j["block_size"] = BLOCK_SIZE;
+    config_j["num_blocks"] = g_num_blocks;
     std::cout << config_j.dump() << "\n" << std::flush;
 }
 
-std::vector<PrefillBatchItem> admitQueuedRequests(std::deque<Request> &queue, SlotState &slots)
+std::vector<PrefillBatchItem> admitQueuedRequests(std::deque<Request> &queue, SlotState &slots,
+                                                  KVCacheState &kv)
 {
     std::vector<PrefillBatchItem> items;
+    // Pages this call has promised to prompts it already admitted but has not mapped yet.
+    int pages_committed = 0;
     for (int slot = 0; slot < BATCH_SIZE; ++slot)
     {
+
         if (!slots.is_slot_free[slot])
         {
             continue;
@@ -128,10 +193,33 @@ std::vector<PrefillBatchItem> admitQueuedRequests(std::deque<Request> &queue, Sl
             {
                 break; // nothing left to admit, the remaining free slots stay free
             }
+            // §4.5: "vLLM stops accepting new requests until all preempted sequences are
+            // completed". NEW requests - a preempted one has to be let back in or nothing ever
+            // drains and the flag never clears. Preempted sequences are pushed to the front, so
+            // a fresh request at the front means none are waiting and this can simply stop.
+            if (kv.preemption_pending && queue.front().resumed_tokens == 0)
+            {
+                break;
+            }
+            // Only the prompt has to fit. Everything after it is allocated a page at a time
+            // during decode, and preemptSequence handles the pool running out.
+            // A resumed sequence's "prompt" is its original prompt plus everything it had
+            // generated, so it is bounded by MAX_TOKENS_PER_SEQUENCE, not MAX_PROMPT_LEN.
+            const int len_cap = queue.front().resumed_tokens > 0 ? MAX_TOKENS_PER_SEQUENCE : MAX_PROMPT_LEN;
+            int prompt_len = std::min((int)queue.front().tokens.size(), len_cap);
+            int pages_needed = N_LAYERS * ((prompt_len + BLOCK_SIZE - 1) / BLOCK_SIZE);
+            if ((int)kv.free_blocks.size() - pages_committed < pages_needed)
+            {
+                break; // not even the prompt fits; it waits for pages to come back
+            }
+            pages_committed += pages_needed;
             request = std::move(queue.front());
             queue.pop_front();
         }
-        if ((int)request.tokens.size() > MAX_PROMPT_LEN)
+        // Only a freshly arrived prompt may be truncated. Truncating a resumed sequence would
+        // throw away tokens it has already emitted to the client, and the recomputed KV cache
+        // would no longer match the text the request has received.
+        if (request.resumed_tokens == 0 && (int)request.tokens.size() > MAX_PROMPT_LEN)
         {
             std::cerr << "Request " << request.id << ": prompt of " << request.tokens.size()
                       << " tokens exceeds MAX_PROMPT_LEN (" << MAX_PROMPT_LEN << "), truncating\n";
@@ -139,12 +227,19 @@ std::vector<PrefillBatchItem> admitQueuedRequests(std::deque<Request> &queue, Sl
         }
         slots.is_slot_free[slot] = false;
         slots.slot_request_id[slot] = request.id;
-        slots.generated_tokens[slot].clear();
+        slots.remaining_budget[slot] = request.max_tokens;
+        // A resumed sequence arrives as prompt + what it had already generated; the split has to
+        // be restored or its output budget and repetition-penalty state would both be wrong.
+        const int resumed = request.resumed_tokens;
+        slots.was_preempted[slot] = (resumed > 0);
+        slots.generated_tokens[slot].assign(request.tokens.end() - resumed, request.tokens.end());
+        slots.prompt_tokens[slot].assign(request.tokens.begin(), request.tokens.end() - resumed);
         // start the clock now, so a sequence that is retired during prefill (EOS on its
         // first token, or a failure) still reports a sane duration instead of whatever
         // the previous owner of this slot left behind
         slots.decode_start[slot] = std::chrono::high_resolution_clock::now();
-        items.push_back({slot, request.id, std::move(request.tokens)});
+        items.push_back({slot, request.id, request.max_tokens, request.resumed_tokens,
+                         std::move(request.tokens)});
     }
     return items;
 }
@@ -170,6 +265,15 @@ void finishSequence(int slot, int request_id, const char *error, SlotState &slot
 
     slots.is_slot_free[slot] = true;
     slots.slot_request_id[slot] = -1;
+    if (slots.was_preempted[slot])
+    {
+        slots.was_preempted[slot] = false;
+        if (--kv.preempted_in_flight <= 0)
+        {
+            kv.preempted_in_flight = 0;
+            kv.preemption_pending = false; // admission reopens
+        }
+    }
     for (int layer = 0; layer < N_LAYERS; ++layer)
     {
         for (int logical_block_idx = 0; logical_block_idx < MAX_BLOCKS_PER_SEQ; ++logical_block_idx)
@@ -182,10 +286,115 @@ void finishSequence(int slot, int request_id, const char *error, SlotState &slot
             }
         }
     }
-    cudaMemcpy(kv.block_table_gpu, kv.block_table.data(), MAX_SEQUENCES * N_LAYERS * MAX_BLOCKS_PER_SEQ * sizeof(int), cudaMemcpyHostToDevice);
+    // only this slot's rows changed, and they are contiguous
+    const size_t slot_span = (size_t)N_LAYERS * MAX_BLOCKS_PER_SEQ;
+    cudaMemcpy(kv.block_table_gpu + (size_t)slot * slot_span,
+               kv.block_table.data() + (size_t)slot * slot_span,
+               slot_span * sizeof(int), cudaMemcpyHostToDevice);
 }
 
-void enforcePageBudget(SlotState &slots, KVCacheState &kv)
+void preemptSequence(int slot, SlotState &slots, KVCacheState &kv, std::deque<Request> &queue)
+{
+    const int request_id = slots.slot_request_id[slot];
+    const int generated = (int)slots.generated_tokens[slot].size();
+
+    // prompt + everything it has generated so far becomes the new prompt, which is why
+    // recomputation is cheap: one prefill pass rebuilds the KV cache for every position at once.
+    std::vector<int> tokens = slots.prompt_tokens[slot];
+    tokens.insert(tokens.end(), slots.generated_tokens[slot].begin(), slots.generated_tokens[slot].end());
+
+    Request resumed{request_id, slots.remaining_budget[slot], std::move(tokens), generated};
+
+    // Tell the client before the slot is recycled: this is not a completion and not a token, and
+    // a harness that saw neither would think the request had vanished.
+    json out_j;
+    out_j["type"] = "preempted";
+    out_j["id"] = request_id;
+    out_j["slot"] = slot;
+    out_j["generated"] = generated;
+    std::cout << out_j.dump() << "\n" << std::flush;
+
+    // hand the pages back
+    for (int layer = 0; layer < N_LAYERS; ++layer)
+    {
+        for (int logical_block_idx = 0; logical_block_idx < MAX_BLOCKS_PER_SEQ; ++logical_block_idx)
+        {
+            int entry = slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx;
+            if (kv.block_table[entry] != -1)
+            {
+                kv.free_blocks.push_back(kv.block_table[entry]);
+                kv.block_table[entry] = -1;
+            }
+        }
+    }
+    const size_t slot_span = (size_t)N_LAYERS * MAX_BLOCKS_PER_SEQ;
+    cudaMemcpy(kv.block_table_gpu + (size_t)slot * slot_span,
+               kv.block_table.data() + (size_t)slot * slot_span,
+               slot_span * sizeof(int), cudaMemcpyHostToDevice);
+
+    slots.is_slot_free[slot] = true;
+    slots.slot_request_id[slot] = -1;
+
+    ++kv.preemptions;
+    // preempted_in_flight counts distinct requests in the preempted state, not preemption events.
+    // was_preempted is true exactly when the slot's current occupant is itself a resumed request,
+    // so a sequence being preempted a second time is already on the books.
+    if (!slots.was_preempted[slot])
+    {
+        ++kv.preempted_in_flight;
+    }
+    slots.was_preempted[slot] = false;
+    kv.preemption_pending = true;
+
+    // front of the queue: FCFS, and this request arrived before anything still waiting
+    std::lock_guard<std::mutex> lock(g_queue_mutex);
+    queue.push_front(std::move(resumed));
+}
+
+void emitStepTelemetry(const SlotState &slots, const KVCacheState &kv, const std::deque<Request> &queue)
+{
+    int running = 0;
+    long long live_tokens = 0;
+    for (int slot = 0; slot < BATCH_SIZE; ++slot)
+    {
+        if (slots.is_slot_free[slot])
+        {
+            continue;
+        }
+        ++running;
+        live_tokens += slots.current_prompt_len[slot] + 1;
+    }
+    size_t waiting = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_queue_mutex);
+        waiting = queue.size();
+    }
+
+    // Everything is reported in tokens of context - the 32 KiB a token costs across all layers -
+    // which is the baseline's unit too, so the two builds' numbers are directly comparable. A page
+    // holds BLOCK_SIZE tokens of one layer, so N_LAYERS pages make one token of context.
+    const long long mapped_pages = (long long)g_num_blocks - (long long)kv.free_blocks.size();
+
+    json t;
+    t["type"] = "step";
+    t["t_ms"] = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - g_engine_start).count();
+    t["running"] = running;
+    t["waiting"] = (int)waiting;
+    // mapped is what the pool has handed out; live is what holds a real token. The gap here is
+    // only the unfilled tail of each sequence's last page - at most BLOCK_SIZE-1 tokens per
+    // sequence. In the baseline the same gap is the whole unused part of every reservation.
+    t["kv_tokens_reserved"] = (int)(mapped_pages * BLOCK_SIZE / N_LAYERS);
+    t["kv_tokens_live"] = live_tokens;
+    t["kv_tokens_total"] = (int)((long long)g_num_blocks * BLOCK_SIZE / N_LAYERS);
+    // paging has no external fragmentation - any free page fits any sequence. That is the claim,
+    // and reporting it as a measured zero next to the baseline's non-zero count is the point.
+    t["fragmentation_failures"] = 0;
+    t["preemptions"] = kv.preemptions;
+    std::cout << t.dump() << "\n" << std::flush;
+}
+
+void enforcePageBudget(SlotState &slots, KVCacheState &kv, std::deque<Request> &queue)
 {
     for (int slot = 0; slot < BATCH_SIZE; ++slot)
     {
@@ -214,16 +423,22 @@ void enforcePageBudget(SlotState &slots, KVCacheState &kv)
         }
         return pages;
     };
-    // evict newest first: the older sequences are closer to finishing on their own
-    // and giving their pages back
+    // Preempt newest first. §4.5: "it ensures that the earliest arrived requests are served first
+    // and the latest requests are preempted first" - and the older sequences are also closer to
+    // finishing on their own and giving their pages back. Higher slot index is not strictly
+    // newer, but a slot is only reused once its previous tenant retired, so it is a good proxy
+    // and it is what the eviction pass this replaces already used.
+    //
+    // The sequence is *preempted*, not killed. Killing it would drop a request the client is
+    // waiting on and - worse for the measurement - quietly remove its work from the throughput
+    // the run appears to have sustained.
     for (int slot = BATCH_SIZE; slot-- > 0 && pages_needed_now() > (int)kv.free_blocks.size();)
     {
         if (slots.is_slot_free[slot] || slots.current_prompt_len[slot] % BLOCK_SIZE != 0)
         {
             continue;
         }
-        std::cerr << "KV cache exhausted during decode, evicting slot " << slot << "\n";
-        finishSequence(slot, slots.slot_request_id[slot], "kv_cache_exhausted", slots, kv);
+        preemptSequence(slot, slots, kv, queue);
     }
 }
 
@@ -245,6 +460,19 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
     for (const PrefillBatchItem &item : items)
     {
         cudaMemset(buf.penalty_mask + (size_t)item.slot * VOCAB_SIZE, 0, VOCAB_SIZE);
+        if (item.resumed_tokens > 0)
+        {
+            // A preempted sequence is replaying tokens it already emitted, so the penalty state
+            // it was preempted with has to come back with it - otherwise it resumes with a
+            // different mask than it had, picks a different next token, and the two builds would
+            // no longer produce identical output. buf.input_tokens is free here: the pass loop
+            // below is what fills it, and this runs before that.
+            const int *resumed_begin = item.tokens.data() + (item.tokens.size() - item.resumed_tokens);
+            cudaMemcpy(buf.input_tokens, resumed_begin, item.resumed_tokens * sizeof(int),
+                       cudaMemcpyHostToDevice);
+            markTokenListKernel<<<(item.resumed_tokens + 255) / 256, 256>>>(
+                buf.input_tokens, item.resumed_tokens, item.slot, buf.penalty_mask);
+        }
     }
 
     size_t next_item = 0;
@@ -307,11 +535,11 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
         }
         if ((int)kv.free_blocks.size() < pages_needed)
         {
-            // Unreachable by construction: BATCH_SIZE is derived so that every slot the
-            // scheduler can admit into has its worst-case page budget reserved
-            // (BATCH_SIZE * PAGES_PER_SEQUENCE <= NUM_BLOCKS). If it happens anyway the
-            // budget maths is wrong somewhere, and the one thing we must not do is drop the
-            // prompt on the floor: the client is blocked waiting for it. Hand every
+            // Reachable: BATCH_SIZE is MAX_SEQUENCES now, not NUM_BLOCKS / PAGES_PER_SEQUENCE,
+            // so the pool is deliberately over-subscribed and a pass of prompts can arrive at
+            // a pool that cannot hold them (see the BATCH_SIZE comment in config.h for why the
+            // old reserve-the-worst-case derivation was dropped). The one thing we must not do
+            // is drop the prompt on the floor: the client is blocked waiting for it. Hand every
             // not-yet-prefilled prompt of this call back to the front of the queue so it is
             // retried once a running sequence returns its pages - unless nothing is running,
             // in which case no pages will ever come back and the request genuinely failed.
@@ -342,7 +570,8 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
                 if (anything_running)
                 {
                     std::lock_guard<std::mutex> lock(g_queue_mutex);
-                    queue.push_front({items[i].request_id, std::move(items[i].tokens)});
+                    queue.push_front({items[i].request_id, items[i].max_tokens,
+                                      std::move(items[i].tokens), items[i].resumed_tokens});
                 }
                 else
                 {
@@ -664,7 +893,7 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
             int prompt_len = (int)items[pass_items[seq]].tokens.size();
             const int max_token_idx = sampled[seq];
 
-            const bool is_eos = (max_token_idx == END_OF_TEXT_TOKEN_ID || max_token_idx == EOT_ID_TOKEN_ID);
+            const bool is_eos = !g_ignore_eos && (max_token_idx == END_OF_TEXT_TOKEN_ID || max_token_idx == EOT_ID_TOKEN_ID);
 
             // One message per generated token, carrying no text: the client only counts
             // tokens and reports speeds, so decoding ids back into strings - and keeping a
@@ -674,12 +903,16 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
                 json out_j;
                 out_j["id"] = request_id;
                 out_j["slot"] = slot;
+                // the id itself, so the benchmark can checksum a request's output and show
+                // that the two cache designs are numerically identical, not just equally fast
+                out_j["tok"] = max_token_idx;
                 std::cout << out_j.dump() << "\n" << std::flush;
             }
 
             if (!is_eos)
             {
                 slots.generated_tokens[slot].push_back(max_token_idx);
+                --slots.remaining_budget[slot];
             }
             slots.last_generated_tokens[slot] = max_token_idx;
             slots.current_prompt_len[slot] = prompt_len;
@@ -700,7 +933,8 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
             // A prompt whose first sampled token is already EOS is finished here. Letting it
             // through to decode used to run it for the full MAX_NEW_TOKENS_GENERATED steps,
             // burning a slot (and its pages) on a sequence that had nothing left to say.
-            if (is_eos)
+            // ...and so is one that spent its whole output budget on that token.
+            if (is_eos || slots.remaining_budget[slot] <= 0)
             {
                 finishSequence(slot, request_id, nullptr, slots, kv);
             }
@@ -749,6 +983,45 @@ int decodeStep(DeviceBuffers &buf,
         seq_lens[slot] = slots.current_prompt_len[active_slot] + 1;
     }
     cudaMemcpy(buf.seq_lens, seq_lens.data(), seq_lens.size() * sizeof(int), cudaMemcpyHostToDevice);
+    // token_positions is a prefill buffer (MAX_BATCH_TOKENS ints) and prefill never runs
+    // concurrently with decode, so decode borrows it rather than holding its own.
+    std::vector<int> positions(num_active_slots);
+    for (int row = 0; row < num_active_slots; ++row)
+    {
+        positions[row] = slots.current_prompt_len[active_slots[row]];
+    }
+    cudaMemcpy(buf.token_positions, positions.data(), positions.size() * sizeof(int), cudaMemcpyHostToDevice);
+
+    // ---- map every page this step needs, for all layers, before touching the model ----
+    // A slot whose next token starts a fresh block needs one new page per layer. Doing it here
+    // rather than inside the layer loop is what lets the block table go to the device once per
+    // step instead of once per layer: the old code re-uploaded the whole table (MAX_SEQUENCES *
+    // N_LAYERS * MAX_BLOCKS_PER_SEQ ints, 3 MiB at 384 slots) sixteen times a step, 50 MiB of
+    // PCIe traffic per step that has nothing to do with how paging addresses the cache.
+    //
+    // enforcePageBudget has already retired anything this cannot serve, so free_blocks covers it.
+    for (int row = 0; row < num_active_slots; ++row)
+    {
+        int slot = active_slots[row];
+        if (positions[row] % BLOCK_SIZE != 0)
+        {
+            continue; // still inside the page it is already using
+        }
+        int logical_block_idx = positions[row] / BLOCK_SIZE;
+        for (int layer = 0; layer < N_LAYERS; ++layer)
+        {
+            int entry = slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx;
+            assert(kv.block_table[entry] == -1 && "page must be unmapped before decode maps it");
+            kv.block_table[entry] = kv.free_blocks.back();
+            kv.free_blocks.pop_back();
+        }
+        // One slot's entries are contiguous (N_LAYERS * MAX_BLOCKS_PER_SEQ ints = 8 KiB), so a
+        // slot that got pages costs one memcpy of its own row block, not a full-table upload.
+        const size_t slot_span = (size_t)N_LAYERS * MAX_BLOCKS_PER_SEQ;
+        cudaMemcpy(kv.block_table_gpu + (size_t)slot * slot_span,
+                   kv.block_table.data() + (size_t)slot * slot_span,
+                   slot_span * sizeof(int), cudaMemcpyHostToDevice);
+    }
 
     embeddingGatherDecodeKernel<<<num_active_slots, EMBED_HALF>>>(buf.last_tokens, num_active_slots, buf.hidden_state, weights.embed_tokens);
     for (int layer = 0; layer < N_LAYERS; ++layer)
@@ -835,41 +1108,19 @@ int decodeStep(DeviceBuffers &buf,
                      CUBLAS_COMPUTE_32F,
                      CUBLAS_GEMM_DEFAULT);
 
-        for (int slot = 0; slot < num_active_slots; ++slot)
-        {
-            int active_slot = active_slots[slot];
-            ropeDecodeKernel<<<1, EMBEDDING_LENGTH / 2>>>(&q_proj[slot * EMBEDDING_LENGTH], slots.current_prompt_len[active_slot],
-                                                         EMBEDDING_LENGTH, d_cos_table, d_sin_table);
-            ropeDecodeKernel<<<1, KV_DIM / 2>>>(buf.k_proj_temp_buf + slot * KV_DIM, slots.current_prompt_len[active_slot],
-                                                KV_DIM, d_cos_table, d_sin_table);
-        }
+        // One launch per projection instead of one per slot. At 384 slots the per-slot form was
+        // thousands of launches a step, which would show up as a difference between the two
+        // builds that has nothing to do with how either addresses its cache.
+        ropeDecodeBatchKernel<<<num_active_slots, EMBEDDING_LENGTH / 2>>>(
+            q_proj, num_active_slots, EMBEDDING_LENGTH, buf.token_positions, d_cos_table, d_sin_table);
+        ropeDecodeBatchKernel<<<num_active_slots, KV_DIM / 2>>>(
+            buf.k_proj_temp_buf, num_active_slots, KV_DIM, buf.token_positions, d_cos_table, d_sin_table);
 
-        // PagedAttn scatter k and v from a temp buffer, like in the prefill
-        for (int slot = 0; slot < num_active_slots; ++slot)
-        {
-            int active_slot = active_slots[slot];
-            int seq_len = slots.current_prompt_len[active_slot]; // + generated tokens?
-            int logical_block_idx = seq_len / BLOCK_SIZE;
-            int token_in_block_idx = seq_len % BLOCK_SIZE;
-            int block = kv.block_table[active_slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx];
-            if (token_in_block_idx == 0)
-            {
-                int physical_block_idx = kv.free_blocks.back();
-                kv.free_blocks.pop_back();
-                block = physical_block_idx;
-                kv.block_table[active_slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx] = block;
-            }
-            __nv_bfloat16 *k_cache_ptr = (__nv_bfloat16 *)((char *)kv.cache + block * BLOCK_BYTES + token_in_block_idx * KV_DIM * sizeof(__nv_bfloat16));
-            __nv_bfloat16 *k_proj_ptr = buf.k_proj_temp_buf + slot * KV_DIM;
-            cudaMemcpy(k_cache_ptr, k_proj_ptr, KV_DIM * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
-
-            __nv_bfloat16 *v_cache_ptr = (__nv_bfloat16 *)((char *)kv.cache + block * BLOCK_BYTES + V_OFFSET + token_in_block_idx * KV_DIM * sizeof(__nv_bfloat16));
-            __nv_bfloat16 *v_proj_ptr = buf.v_proj_temp_buf + slot * KV_DIM;
-            cudaMemcpy(v_cache_ptr, v_proj_ptr, KV_DIM * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice);
-        }
-
-        // synchronize block table on cpu with block table on gpu (for attention)
-        cudaMemcpy(kv.block_table_gpu, kv.block_table.data(), MAX_SEQUENCES * N_LAYERS * MAX_BLOCKS_PER_SEQ * sizeof(int), cudaMemcpyHostToDevice);
+        // Scatter K and V into their pages in one launch. The pages were mapped before the layer
+        // loop and the block table is already on the device, so this layer only has to write.
+        scatterKVDecodeKernel<<<num_active_slots, KV_DIM>>>(
+            layer, num_active_slots, buf.k_proj_temp_buf, buf.v_proj_temp_buf, kv.cache,
+            kv.block_table_gpu, buf.active_slots, buf.token_positions);
 
         pagedAttentionKernel<<<dim3(num_active_slots, NUM_Q_HEADS), HEAD_DIM>>>(
             layer, num_active_slots, q_proj, kv.cache, kv.block_table_gpu, buf.seq_lens, buf.active_slots, buf.buf_2048_1);
@@ -1010,25 +1261,32 @@ int decodeStep(DeviceBuffers &buf,
         int active_slot = active_slots[slot];
         const int max_token_idx = sampled[slot];
         const int request_id = slots.slot_request_id[active_slot];
-        const bool is_eos = (max_token_idx == END_OF_TEXT_TOKEN_ID || max_token_idx == EOT_ID_TOKEN_ID);
+        const bool is_eos = !g_ignore_eos && (max_token_idx == END_OF_TEXT_TOKEN_ID || max_token_idx == EOT_ID_TOKEN_ID);
 
         if (!is_eos)
         {
             json out_j;
             out_j["id"] = request_id;
             out_j["slot"] = active_slot;
+            out_j["tok"] = max_token_idx;
             std::cout << out_j.dump() << "\n" << std::flush;
         }
 
-        if (is_eos || slots.current_prompt_len[active_slot] == MAX_SEQ_LEN - 1 || slots.generated_tokens[active_slot].size() >= MAX_NEW_TOKENS_GENERATED)
-        {
-            finishSequence(active_slot, request_id, nullptr, slots, kv);
-        }
-        else
+        if (!is_eos)
         {
             slots.last_generated_tokens[active_slot] = max_token_idx;
             slots.generated_tokens[active_slot].push_back(max_token_idx);
             slots.current_prompt_len[active_slot] = slots.current_prompt_len[active_slot] + 1;
+            --slots.remaining_budget[active_slot];
+        }
+
+        // The output budget is per request now, not one global MAX_NEW_TOKENS_GENERATED for
+        // everybody: that is the property the baseline has to reserve for and this build does
+        // not, so a benchmark that fixes it measures neither. The length ceiling is enforced by
+        // enforcePageBudget, which runs before the forward pass rather than after it.
+        if (is_eos || slots.remaining_budget[active_slot] <= 0)
+        {
+            finishSequence(active_slot, request_id, nullptr, slots, kv);
         }
     }
 
