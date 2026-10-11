@@ -20,6 +20,7 @@ struct PrefillBatchItem
     int request_id;
     int max_tokens;         // output budget still owed to this request
     int resumed_tokens;     // unused here: a reservation never has to preempt anything
+    int seq_index;          // which answer of a parallel-sampling request this is; 0 otherwise
     std::vector<int> tokens;
 };
 
@@ -60,6 +61,13 @@ struct DeviceBuffers
     float *argmax_values;     // [BATCH_SIZE, ARGMAX_CHUNKS_PER_ROW] first-pass partials
     int *argmax_indices;      // [BATCH_SIZE, ARGMAX_CHUNKS_PER_ROW]
     int *sampled_tokens;      // [BATCH_SIZE] the only thing the host reads back per step
+    // Random sampling (§6.3). Allocated unconditionally - about 4 KiB at BATCH_SIZE 384 -
+    // because making them conditional would make the greedy and sampled builds disagree on
+    // how much VRAM is left, and the KV pool is exactly "whatever is left".
+    float *row_max;           // [BATCH_SIZE] stable-softmax shift, one per logits row
+    float *exp_sums;          // [BATCH_SIZE, ARGMAX_CHUNKS_PER_ROW] second-pass partials
+    int *rng_keys;            // [BATCH_SIZE] which random stream this row draws from
+    int *rng_positions;       // [BATCH_SIZE] how far along that stream it is
     // Repetition penalty state: one byte per (slot, token), 1 once the sequence has emitted
     // that token. Replaces re-deriving the set from generated_tokens on the host every step.
     unsigned char *penalty_mask; // [BATCH_SIZE, VOCAB_SIZE]
@@ -75,6 +83,10 @@ struct SlotState
     std::vector<int> last_generated_tokens;           // token to feed back in the next step
     std::vector<int> current_prompt_len;              // tokens already in the KV cache
     std::vector<int> slot_request_id;                 // which request owns the slot, -1 if none
+    // Which of that request's answers this slot is producing (§6.3). Always 0 outside parallel
+    // sampling. It is carried separately from the request id because several slots legitimately
+    // share an id, and every message the engine emits has to say which one it is about.
+    std::vector<int> slot_seq_index;
     std::vector<int> remaining_budget;                // output tokens the request may still get
     std::vector<std::chrono::high_resolution_clock::time_point> decode_start;
 
@@ -135,6 +147,17 @@ void kvSyncSlotTables(const KVCacheState &kv);
 
 // Set from the IGNORE_EOS environment variable; see engine.cu.
 extern bool g_ignore_eos;
+extern float g_temperature;
+// §6.4: accepted and reported so the two builds label their runs identically. Contiguous
+// allocation cannot share a prefix, which is the point of the experiment.
+extern int g_shared_prefix_len;
+extern unsigned int g_sampling_seed;
+
+// One sampling entry point for both prefill and decode. rng_keys/rng_positions are read only
+// when g_temperature > 0; under greedy they are ignored and may hold anything.
+void sampleTokens(DeviceBuffers &buf, int num_rows, const unsigned char *penalty_mask,
+                  const int *row_slot_ids, const std::vector<int> &rng_keys,
+                  const std::vector<int> &rng_positions);
 
 // ---- startup ----
 

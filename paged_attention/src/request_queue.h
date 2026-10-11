@@ -24,12 +24,20 @@
 // this says how many of those trailing tokens were generated rather than prompted. The
 // scheduler needs the split to keep the output budget and the repetition-penalty mask
 // honest across the preemption.
+//
+// `seq_index` distinguishes the sequences of one parallel-sampling request (§6.3). A request
+// asking for n answers is expanded into n Requests here, at the point it is read, rather than
+// inside the scheduler: n independent sequences is exactly what the contiguous baseline has to
+// do with them anyway, and keeping the expansion out of the scheduler means the admission path,
+// the preemption path and the slot bookkeeping all stay as they were. Sharing the prompt's
+// pages between them is a separate concern that belongs to the paged allocator, not here.
 struct Request
 {
     int id;
     int max_tokens;
     std::vector<int> tokens;
     int resumed_tokens = 0;
+    int seq_index = 0;
 };
 
 // Guards the request queue against the stdin reader thread.

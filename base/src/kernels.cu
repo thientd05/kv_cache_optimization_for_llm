@@ -495,6 +495,23 @@ __device__ __forceinline__ void argmaxMerge(float &best_value, int &best_index, 
     }
 }
 
+// One place for the repetition penalty, because greedy and sampled decoding must apply it
+// identically: a token the sequence has already emitted has to be pushed down *before* the
+// comparison in one case and before the softmax in the other, and any drift between the two
+// would show up as the sampler and the argmax disagreeing on an unpenalised row.
+// Two-sided on purpose - divide a positive logit, multiply a negative one - so the token moves
+// down whichever side of zero it started on.
+__device__ inline float penalisedLogit(const __nv_bfloat16 *row_logits,
+                                       const unsigned char *row_mask, int token)
+{
+    const float logit = (float)row_logits[token];
+    if (row_mask != nullptr && row_mask[token] != 0)
+    {
+        return logit > 0.0f ? logit / REPETITION_PENALTY : logit * REPETITION_PENALTY;
+    }
+    return logit;
+}
+
 __global__ void argmaxPartialKernel(const __nv_bfloat16 *logits, int num_rows,
                                     const unsigned char *penalty_mask, const int *row_slot_ids,
                                     float *partial_values, int *partial_indices)
@@ -520,13 +537,7 @@ __global__ void argmaxPartialKernel(const __nv_bfloat16 *logits, int num_rows,
     // consecutive threads read consecutive tokens, so every pass over the row is coalesced
     for (int token = chunk_begin + threadIdx.x; token < chunk_end; token += ARGMAX_BLOCK_THREADS)
     {
-        float logit = (float)row_logits[token];
-        if (row_mask != nullptr && row_mask[token] != 0)
-        {
-            // same two-sided penalty as before: divide a positive logit, multiply a negative
-            // one, so either way the token is pushed down
-            logit = logit > 0.0f ? logit / REPETITION_PENALTY : logit * REPETITION_PENALTY;
-        }
+        const float logit = penalisedLogit(row_logits, row_mask, token);
         argmaxMerge(best_value, best_index, logit, token);
     }
 
@@ -606,4 +617,219 @@ __global__ void markSampledTokensKernel(const int *sampled_tokens, const int *ro
         return;
     }
     penalty_mask[(size_t)row_slot_ids[row] * VOCAB_SIZE + sampled_tokens[row]] = 1;
+}
+
+// ---- random sampling -------------------------------------------------------------------
+//
+// Greedy decoding cannot produce the §6.3 workloads: "n different answers to one prompt" is
+// not a thing a model that always takes the argmax can do. This is temperature sampling over
+// the full vocabulary, reusing the argmax two-pass geometry so the shapes, the chunking and
+// the repetition penalty stay shared between the two paths.
+//
+// Top-p is deliberately absent. Truncating the nucleus needs the distribution in sorted order,
+// which on this device means either a sort or ~20 bisection passes over 128256 elements every
+// step, and neither buys anything here: the experiments that need sampling need the sequences
+// to *diverge*, not to match vLLM's exact sampler. Beam search does not sample at all.
+
+// Counter-based, so a token's randomness is a pure function of (seed, sequence, position).
+// A stateful generator would make a run unreproducible and - worse - would make a preempted
+// sequence resume onto a different random stream than the one it was recomputed from, which
+// would break the token invariant every run is checked against. splitmix64's finaliser.
+__device__ inline float counterUniform(unsigned int seed, unsigned int seq_key, unsigned int step)
+{
+    unsigned long long z = ((unsigned long long)seq_key << 32) ^ (unsigned long long)step;
+    z ^= (unsigned long long)seed * 0x9E3779B97F4A7C15ULL;
+    z += 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z = z ^ (z >> 31);
+    // 24 bits is a float's whole mantissa, and shifting rather than masking keeps the result
+    // strictly below 1.0 - a u of exactly 1.0 would fall off the end of the CDF walk.
+    return (float)(z >> 40) * (1.0f / 16777216.0f);
+}
+
+__global__ void rowMaxKernel(const float *partial_values, int num_rows, float *row_max)
+{
+    const int row = blockIdx.x;
+    if (row >= num_rows)
+    {
+        return;
+    }
+    __shared__ float values[ARGMAX_CHUNKS_PER_ROW];
+    const int chunk = threadIdx.x;
+    values[chunk] = partial_values[row * ARGMAX_CHUNKS_PER_ROW + chunk];
+    __syncthreads();
+    for (int stride = ARGMAX_CHUNKS_PER_ROW / 2; stride > 0; stride >>= 1)
+    {
+        if (chunk < stride)
+        {
+            values[chunk] = fmaxf(values[chunk], values[chunk + stride]);
+        }
+        __syncthreads();
+    }
+    if (chunk == 0)
+    {
+        row_max[row] = values[0];
+    }
+}
+
+__global__ void expSumPartialKernel(const __nv_bfloat16 *logits, int num_rows,
+                                    const unsigned char *penalty_mask, const int *row_slot_ids,
+                                    const float *row_max, float inv_temperature,
+                                    float *partial_sums)
+{
+    const int row = blockIdx.y;
+    if (row >= num_rows)
+    {
+        return;
+    }
+    const int chunk_begin = blockIdx.x * ARGMAX_CHUNK_TOKENS;
+    const int chunk_end = min(chunk_begin + ARGMAX_CHUNK_TOKENS, VOCAB_SIZE);
+
+    const __nv_bfloat16 *row_logits = logits + (size_t)row * VOCAB_SIZE;
+    const unsigned char *row_mask = penalty_mask == nullptr
+                                        ? nullptr
+                                        : penalty_mask + (size_t)row_slot_ids[row] * VOCAB_SIZE;
+    // Subtracting the row max before exp is what keeps this finite: raw logits reach ~30 and
+    // expf(30 / 0.7) overflows a float.
+    const float m = row_max[row];
+
+    float sum = 0.0f;
+    for (int token = chunk_begin + threadIdx.x; token < chunk_end; token += ARGMAX_BLOCK_THREADS)
+    {
+        sum += __expf((penalisedLogit(row_logits, row_mask, token) - m) * inv_temperature);
+    }
+
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+    {
+        sum += __shfl_down_sync(WARP_FULL_MASK, sum, offset);
+    }
+
+    constexpr int warps_per_block = ARGMAX_BLOCK_THREADS / WARP_SIZE;
+    __shared__ float warp_sums[warps_per_block];
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    if (lane == 0)
+    {
+        warp_sums[warp] = sum;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        float total = 0.0f;
+        for (int w = 0; w < warps_per_block; ++w)
+        {
+            total += warp_sums[w];
+        }
+        partial_sums[row * ARGMAX_CHUNKS_PER_ROW + blockIdx.x] = total;
+    }
+}
+
+// <<<num_rows, ARGMAX_BLOCK_THREADS>>>
+// Inverse-CDF sampling in two nested walks, so no step ever scans the whole 128k row serially:
+// first across the 128 chunk sums to find the chunk the draw lands in, then across that chunk's
+// ~1000 tokens. Both walks are prefix sums in shared memory, which is why the order of the
+// tokens is preserved - a CDF needs order, and a strided reduction would destroy it.
+__global__ void sampleFinalizeKernel(const __nv_bfloat16 *logits, int num_rows,
+                                     const unsigned char *penalty_mask, const int *row_slot_ids,
+                                     const float *row_max, const float *partial_sums,
+                                     float inv_temperature, unsigned int seed,
+                                     const int *row_rng_keys, const int *row_positions,
+                                     int *sampled_tokens)
+{
+    const int row = blockIdx.x;
+    if (row >= num_rows)
+    {
+        return;
+    }
+
+    __shared__ float chunk_prefix[ARGMAX_CHUNKS_PER_ROW];
+    __shared__ float thread_prefix[ARGMAX_BLOCK_THREADS];
+    __shared__ int s_chunk;
+    __shared__ float s_target;
+    __shared__ int s_result;
+
+    if (threadIdx.x < ARGMAX_CHUNKS_PER_ROW)
+    {
+        chunk_prefix[threadIdx.x] = partial_sums[row * ARGMAX_CHUNKS_PER_ROW + threadIdx.x];
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        for (int c = 1; c < ARGMAX_CHUNKS_PER_ROW; ++c)
+        {
+            chunk_prefix[c] += chunk_prefix[c - 1];
+        }
+        const float total = chunk_prefix[ARGMAX_CHUNKS_PER_ROW - 1];
+        const float u = counterUniform(seed, (unsigned int)row_rng_keys[row],
+                                       (unsigned int)row_positions[row]);
+        float target = u * total;
+        int chunk = ARGMAX_CHUNKS_PER_ROW - 1;
+        for (int c = 0; c < ARGMAX_CHUNKS_PER_ROW; ++c)
+        {
+            if (target < chunk_prefix[c])
+            {
+                chunk = c;
+                break;
+            }
+        }
+        s_chunk = chunk;
+        s_target = target - (chunk > 0 ? chunk_prefix[chunk - 1] : 0.0f);
+        // A row whose mass is entirely in one token can leave target exactly at the boundary;
+        // falling back to the last token of the chunk is correct and keeps the walk in range.
+        s_result = min(chunk * ARGMAX_CHUNK_TOKENS + ARGMAX_CHUNK_TOKENS - 1, VOCAB_SIZE - 1);
+    }
+    __syncthreads();
+
+    const int chunk_begin = s_chunk * ARGMAX_CHUNK_TOKENS;
+    const int chunk_end = min(chunk_begin + ARGMAX_CHUNK_TOKENS, VOCAB_SIZE);
+    constexpr int span = (ARGMAX_CHUNK_TOKENS + ARGMAX_BLOCK_THREADS - 1) / ARGMAX_BLOCK_THREADS;
+
+    const __nv_bfloat16 *row_logits = logits + (size_t)row * VOCAB_SIZE;
+    const unsigned char *row_mask = penalty_mask == nullptr
+                                        ? nullptr
+                                        : penalty_mask + (size_t)row_slot_ids[row] * VOCAB_SIZE;
+    const float m = row_max[row];
+
+    // Contiguous spans, not a strided loop: thread t owns tokens [t*span, (t+1)*span) so the
+    // per-thread sums can be prefix-scanned straight into a CDF.
+    const int begin = chunk_begin + (int)threadIdx.x * span;
+    float local = 0.0f;
+    for (int token = begin; token < min(begin + span, chunk_end); ++token)
+    {
+        local += __expf((penalisedLogit(row_logits, row_mask, token) - m) * inv_temperature);
+    }
+    thread_prefix[threadIdx.x] = local;
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        for (int t = 1; t < ARGMAX_BLOCK_THREADS; ++t)
+        {
+            thread_prefix[t] += thread_prefix[t - 1];
+        }
+    }
+    __syncthreads();
+
+    const float before = threadIdx.x == 0 ? 0.0f : thread_prefix[threadIdx.x - 1];
+    if (begin < chunk_end && s_target >= before && s_target < thread_prefix[threadIdx.x])
+    {
+        float acc = before;
+        for (int token = begin; token < min(begin + span, chunk_end); ++token)
+        {
+            acc += __expf((penalisedLogit(row_logits, row_mask, token) - m) * inv_temperature);
+            if (s_target < acc)
+            {
+                s_result = token;
+                break;
+            }
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        sampled_tokens[row] = s_result;
+    }
 }

@@ -291,7 +291,10 @@ def submit_all():
             # The output budget is per request on the wire now (see request_queue.h); this
             # harness is the interactive one, so it just asks for the engine's full cap.
             # bench.py is the thing that varies it.
-            engine.stdin.write(f"{entry['id']} {MAX_NEW_TOKENS} " + " ".join(map(str, tokens)) + "\n")
+            # The third field is n_seqs, the number of answers wanted for this prompt. The
+            # interactive harness always wants one; see src/request_queue.cpp for the format.
+            engine.stdin.write(f"{entry['id']} {MAX_NEW_TOKENS} 1 "
+                               + " ".join(map(str, tokens)) + "\n")
             engine.stdin.flush()
             _progress.set()
     except (BrokenPipeError, OSError) as exc:

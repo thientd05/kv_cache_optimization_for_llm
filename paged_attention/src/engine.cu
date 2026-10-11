@@ -1,6 +1,8 @@
 #include "engine.cuh"
 
+#include <algorithm>
 #include <cassert>
+#include <unordered_map>
 #include <cstdlib>
 #include <chrono>
 #include <iostream>
@@ -20,6 +22,11 @@ using json = nlohmann::json;
 // the same number of tokens in every build, so the two engines do identical work and the
 // "oracle" reservation policy in the baseline really is an oracle rather than an estimate.
 bool g_ignore_eos = false;
+// 0 means greedy, which stays the default: every experiment before §6.3 depends on the engine
+// being deterministic, and the checksum gate that proves the two builds agree depends on it
+// absolutely. Sampling is opt-in per run via TEMPERATURE.
+float g_temperature = 0.0f;
+unsigned int g_sampling_seed = 0;
 
 // Serving telemetry, not scheduler state.
 static const std::chrono::high_resolution_clock::time_point g_engine_start =
@@ -31,6 +38,7 @@ SlotState::SlotState()
       last_generated_tokens(BATCH_SIZE),
       current_prompt_len(BATCH_SIZE, 0),
       slot_request_id(BATCH_SIZE, -1),
+      slot_seq_index(BATCH_SIZE, 0),
       remaining_budget(BATCH_SIZE, 0),
       prompt_tokens(BATCH_SIZE),
       was_preempted(BATCH_SIZE, false),
@@ -90,13 +98,80 @@ DeviceBuffers allocateDeviceBuffers()
     buf.argmax_values = (float *)allocDevice(BATCH_SIZE * ARGMAX_CHUNKS_PER_ROW * sizeof(float), "argmax values");
     buf.argmax_indices = (int *)allocDevice(BATCH_SIZE * ARGMAX_CHUNKS_PER_ROW * sizeof(int), "argmax indices");
     buf.sampled_tokens = (int *)allocDevice(BATCH_SIZE * sizeof(int), "sampled tokens");
+    buf.row_max = (float *)allocDevice(BATCH_SIZE * sizeof(float), "sampling row max");
+    buf.exp_sums = (float *)allocDevice(BATCH_SIZE * ARGMAX_CHUNKS_PER_ROW * sizeof(float), "sampling exp sums");
+    buf.rng_keys = (int *)allocDevice(BATCH_SIZE * sizeof(int), "sampling rng keys");
+    buf.rng_positions = (int *)allocDevice(BATCH_SIZE * sizeof(int), "sampling rng positions");
     buf.penalty_mask = (unsigned char *)allocDevice((size_t)BATCH_SIZE * VOCAB_SIZE, "repetition penalty mask");
     cudaMemset(buf.penalty_mask, 0, (size_t)BATCH_SIZE * VOCAB_SIZE);
 
     return buf;
 }
 
+// Greedy or sampled, through one entry point, because prefill and decode both have to make the
+// choice and any drift between them would show up as a sequence whose first token obeyed a
+// different policy than the rest of it.
+//
+// The greedy path is byte-for-byte what it was: argmax partial + finalize. The sampled path
+// reuses that same first pass - its per-chunk maxima are exactly the shift a stable softmax
+// needs - and adds two more. Nothing below the early return runs while g_temperature is 0,
+// which is the default and what every experiment before §6.3 relies on.
+void sampleTokens(DeviceBuffers &buf, int num_rows, const unsigned char *penalty_mask,
+                  const int *row_slot_ids, const std::vector<int> &rng_keys,
+                  const std::vector<int> &rng_positions)
+{
+    argmaxPartialKernel<<<dim3(ARGMAX_CHUNKS_PER_ROW, num_rows), ARGMAX_BLOCK_THREADS>>>(
+        buf.embed_proj, num_rows, penalty_mask, row_slot_ids,
+        buf.argmax_values, buf.argmax_indices);
+
+    if (g_temperature <= 0.0f)
+    {
+        argmaxFinalizeKernel<<<num_rows, ARGMAX_CHUNKS_PER_ROW>>>(
+            buf.argmax_values, buf.argmax_indices, num_rows, buf.sampled_tokens);
+        return;
+    }
+
+    cudaMemcpy(buf.rng_keys, rng_keys.data(), num_rows * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(buf.rng_positions, rng_positions.data(), num_rows * sizeof(int),
+               cudaMemcpyHostToDevice);
+
+    const float inv_t = 1.0f / g_temperature;
+    rowMaxKernel<<<num_rows, ARGMAX_CHUNKS_PER_ROW>>>(buf.argmax_values, num_rows, buf.row_max);
+    expSumPartialKernel<<<dim3(ARGMAX_CHUNKS_PER_ROW, num_rows), ARGMAX_BLOCK_THREADS>>>(
+        buf.embed_proj, num_rows, penalty_mask, row_slot_ids, buf.row_max, inv_t, buf.exp_sums);
+    sampleFinalizeKernel<<<num_rows, ARGMAX_BLOCK_THREADS>>>(
+        buf.embed_proj, num_rows, penalty_mask, row_slot_ids, buf.row_max, buf.exp_sums,
+        inv_t, g_sampling_seed, buf.rng_keys, buf.rng_positions, buf.sampled_tokens);
+}
+
 int g_num_blocks = 0;
+PreemptionPolicy g_preemption_policy = PreemptionPolicy::Recompute;
+
+// §6.4. 0 means "no shared prefix", which is every experiment but that one, and the whole code
+// path below then costs a single comparison per prompt.
+int g_shared_prefix_len = 0;
+
+int sharedPrefixBlocks()
+{
+    // Whole pages only. A partial last page cannot be shared: the request's own tokens continue
+    // inside it, so writing them would overwrite what every other request is reading. The paper
+    // marks that page copy-on-write; dropping it from the shared region costs at most
+    // BLOCK_SIZE-1 tokens of sharing and removes the only place a shared page is ever written.
+    return g_shared_prefix_len / BLOCK_SIZE;
+}
+
+// True when the registry is established and this prompt really does start with the prefix. The
+// check is on the tokens, not on a flag passed in from outside: a prompt that merely claims the
+// prefix and does not have it would be served another request's KV cache.
+static bool promptCarriesPrefix(const KVCacheState &kv, const std::vector<int> &tokens)
+{
+    const int shared = sharedPrefixBlocks() * BLOCK_SIZE;
+    if (shared == 0 || (int)kv.prefix_tokens.size() != shared || (int)tokens.size() < shared)
+    {
+        return false;
+    }
+    return std::equal(kv.prefix_tokens.begin(), kv.prefix_tokens.end(), tokens.begin());
+}
 
 KVCacheState allocateKVCache()
 {
@@ -140,9 +215,41 @@ KVCacheState allocateKVCache()
     kv.cache = (__nv_bfloat16 *)allocDevice((size_t)g_num_blocks * BLOCK_BYTES, "KV cache");
     kv.free_blocks.resize(g_num_blocks);
     std::iota(kv.free_blocks.begin(), kv.free_blocks.end(), 0);
+    kv.block_refcount.assign(g_num_blocks, 0);
+    kv.shared_page_refs = 0;
     kv.preemptions = 0;
     kv.preemption_pending = false;
     kv.preempted_in_flight = 0;
+
+    // The host buffer is claimed *after* the pool, on purpose: pinned host memory costs no VRAM,
+    // and allocating it last makes it impossible for the swap policy to end up with a smaller KV
+    // pool than the recompute policy. The two policies have to be measured against the same pool
+    // or the comparison is about pool size instead of about recovery cost.
+    kv.prefix_pages.assign((size_t)N_LAYERS * sharedPrefixBlocks(), -1);
+    kv.prefix_hits = 0;
+    kv.prefix_pinned_pages = 0;
+
+    kv.swap_host = nullptr;
+    kv.swap_outs = 0;
+    kv.swap_ins = 0;
+    kv.swap_fallbacks = 0;
+    kv.swap_bytes = 0;
+    kv.swap_ms = 0.0;
+    if (g_preemption_policy == PreemptionPolicy::Swap)
+    {
+        const int host_pages = (int)(SWAP_HOST_BYTES / BLOCK_BYTES);
+        if (cudaHostAlloc((void **)&kv.swap_host, (size_t)host_pages * BLOCK_BYTES,
+                          cudaHostAllocDefault) != cudaSuccess)
+        {
+            std::cerr << "Could not pin " << SWAP_HOST_BYTES / B_TO_MB
+                      << " MiB of host RAM for swap space\n";
+            std::exit(1);
+        }
+        kv.swap_free_pages.resize(host_pages);
+        std::iota(kv.swap_free_pages.begin(), kv.swap_free_pages.end(), 0);
+        std::cerr << "Swap space: " << SWAP_HOST_BYTES / B_TO_MB << " MiB pinned host RAM = "
+                  << host_pages << " pages\n";
+    }
     return kv;
 }
 
@@ -167,8 +274,19 @@ void reportEngineConfig()
     config_j["max_batch_tokens"] = MAX_BATCH_TOKENS;
     config_j["max_prompt_len"] = MAX_PROMPT_LEN;
     config_j["max_new_tokens"] = MAX_NEW_TOKENS_GENERATED;
+    // So a result file carries the sampler it was produced under. Two runs with different
+    // temperatures are not comparable, and without this the difference would be invisible
+    // after the fact.
+    config_j["temperature"] = g_temperature;
+    config_j["sampling_seed"] = (int)g_sampling_seed;
     config_j["kv_pool_tokens"] = (int)((long long)g_num_blocks * BLOCK_SIZE / N_LAYERS);
     config_j["block_size"] = BLOCK_SIZE;
+    // Which recovery path a preemption takes (§7.3). Without this a result file cannot be told
+    // apart from one taken under the other policy.
+    config_j["shared_prefix_len"] = g_shared_prefix_len;
+    config_j["shared_prefix_blocks"] = sharedPrefixBlocks();
+    config_j["preemption_policy"] =
+        g_preemption_policy == PreemptionPolicy::Swap ? "swap" : "recompute";
     config_j["num_blocks"] = g_num_blocks;
     std::cout << config_j.dump() << "\n" << std::flush;
 }
@@ -207,7 +325,13 @@ std::vector<PrefillBatchItem> admitQueuedRequests(std::deque<Request> &queue, Sl
             // generated, so it is bounded by MAX_TOKENS_PER_SEQUENCE, not MAX_PROMPT_LEN.
             const int len_cap = queue.front().resumed_tokens > 0 ? MAX_TOKENS_PER_SEQUENCE : MAX_PROMPT_LEN;
             int prompt_len = std::min((int)queue.front().tokens.size(), len_cap);
-            int pages_needed = N_LAYERS * ((prompt_len + BLOCK_SIZE - 1) / BLOCK_SIZE);
+            int prompt_blocks = (prompt_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+            // §6.4: pages the shared prefix already holds are not asked for again.
+            if (queue.front().resumed_tokens == 0 && promptCarriesPrefix(kv, queue.front().tokens))
+            {
+                prompt_blocks -= sharedPrefixBlocks();
+            }
+            int pages_needed = N_LAYERS * prompt_blocks;
             if ((int)kv.free_blocks.size() - pages_committed < pages_needed)
             {
                 break; // not even the prompt fits; it waits for pages to come back
@@ -238,10 +362,45 @@ std::vector<PrefillBatchItem> admitQueuedRequests(std::deque<Request> &queue, Sl
         // first token, or a failure) still reports a sane duration instead of whatever
         // the previous owner of this slot left behind
         slots.decode_start[slot] = std::chrono::high_resolution_clock::now();
+        slots.slot_seq_index[slot] = request.seq_index;
         items.push_back({slot, request.id, request.max_tokens, request.resumed_tokens,
-                         std::move(request.tokens)});
+                         request.seq_index, std::move(request.tokens)});
     }
     return items;
+}
+
+// Taking and giving back a page now goes through these two, because a raw push_back onto
+// free_blocks is exactly the bug that sharing introduces: a page handed back while a sibling
+// still points at it gets reused under that sibling, and the corruption surfaces as a sequence
+// emitting another sequence's tokens - plausible-looking text, no crash, no assert.
+static int kvTakePage(KVCacheState &kv)
+{
+    const int page = kv.free_blocks.back();
+    kv.free_blocks.pop_back();
+    kv.block_refcount[page] = 1;
+    return page;
+}
+
+static void kvSharePage(KVCacheState &kv, int page)
+{
+    ++kv.block_refcount[page];
+    ++kv.shared_page_refs;
+}
+
+static void kvDropPage(KVCacheState &kv, int page)
+{
+    if (page < 0)
+    {
+        return;
+    }
+    if (kv.block_refcount[page] > 1)
+    {
+        --kv.block_refcount[page];
+        --kv.shared_page_refs;
+        return;
+    }
+    kv.block_refcount[page] = 0;
+    kv.free_blocks.push_back(page);
 }
 
 void finishSequence(int slot, int request_id, const char *error, SlotState &slots, KVCacheState &kv)
@@ -253,6 +412,7 @@ void finishSequence(int slot, int request_id, const char *error, SlotState &slot
     json done_j;
     done_j["id"] = request_id;
     done_j["slot"] = slot;
+    done_j["seq"] = slots.slot_seq_index[slot];
     done_j["done"] = true;
     done_j["tokens"] = tokens;
     done_j["decode_time"] = decode_ms;
@@ -281,7 +441,7 @@ void finishSequence(int slot, int request_id, const char *error, SlotState &slot
             int block_idx = slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx;
             if (kv.block_table[block_idx] != -1)
             {
-                kv.free_blocks.push_back(kv.block_table[block_idx]);
+                kvDropPage(kv, kv.block_table[block_idx]);
                 kv.block_table[block_idx] = -1;
             }
         }
@@ -293,17 +453,234 @@ void finishSequence(int slot, int request_id, const char *error, SlotState &slot
                slot_span * sizeof(int), cudaMemcpyHostToDevice);
 }
 
+bool kvPageAccountingHolds(const KVCacheState &kv)
+{
+    for (int page : kv.free_blocks)
+    {
+        if (page < 0 || page >= (int)kv.block_refcount.size() || kv.block_refcount[page] != 0)
+        {
+            return false; // on the free list while somebody still points at it
+        }
+    }
+    long long held = 0;
+    for (int rc : kv.block_refcount)
+    {
+        if (rc < 0)
+        {
+            return false;
+        }
+        held += (rc > 0);
+    }
+    return held + (long long)kv.free_blocks.size() == (long long)kv.block_refcount.size();
+}
+
+// Pushes a sequence's pages out to host RAM instead of throwing them away, and parks the
+// sequence in kv.swapped so swapInSequences() can restore it with no prefill pass at all.
+//
+// Returns false when it cannot be done, and the caller then recomputes instead. Two reasons:
+//   - not enough free host pages
+//   - one of this sequence's pages is shared with a sibling (refcount > 1, §4.4). The page would
+//     survive for the sibling, but this sequence would have to come back onto a *fresh* page and
+//     the sharing would be silently lost. Recomputing is both simpler and more honest. With
+//     n_seqs = 1 - every §7.3 run - no page is ever shared, so this branch does not fire there.
+static bool swapOutSequence(int slot, SlotState &slots, KVCacheState &kv)
+{
+    const size_t slot_span = (size_t)N_LAYERS * MAX_BLOCKS_PER_SEQ;
+    const int *row = kv.block_table.data() + (size_t)slot * slot_span;
+
+    int mapped = 0;
+    for (size_t i = 0; i < slot_span; ++i)
+    {
+        if (row[i] == -1)
+        {
+            continue;
+        }
+        if (kv.block_refcount[row[i]] > 1)
+        {
+            return false; // shared page: see above
+        }
+        ++mapped;
+    }
+    if (mapped > (int)kv.swap_free_pages.size())
+    {
+        return false; // host buffer full
+    }
+
+    SwappedSequence out{};
+    out.request_id = slots.slot_request_id[slot];
+    out.seq_index = slots.slot_seq_index[slot];
+    out.remaining_budget = slots.remaining_budget[slot];
+    out.context_len = slots.current_prompt_len[slot];
+    out.last_token = slots.last_generated_tokens[slot];
+    out.prompt_tokens = slots.prompt_tokens[slot];
+    out.generated_tokens = slots.generated_tokens[slot];
+    out.host_pages.assign(slot_span, -1);
+
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (size_t i = 0; i < slot_span; ++i)
+    {
+        const int page = row[i];
+        if (page == -1)
+        {
+            continue;
+        }
+        const int host_page = kv.swap_free_pages.back();
+        kv.swap_free_pages.pop_back();
+        cudaMemcpy((char *)kv.swap_host + (size_t)host_page * BLOCK_BYTES,
+                   (char *)kv.cache + (size_t)page * BLOCK_BYTES,
+                   BLOCK_BYTES, cudaMemcpyDeviceToHost);
+        out.host_pages[i] = host_page;
+        kvDropPage(kv, page);
+        kv.block_table[(size_t)slot * slot_span + i] = -1;
+    }
+    cudaMemcpy(kv.block_table_gpu + (size_t)slot * slot_span,
+               kv.block_table.data() + (size_t)slot * slot_span,
+               slot_span * sizeof(int), cudaMemcpyHostToDevice);
+    kv.swap_ms += std::chrono::duration<double, std::milli>(
+                      std::chrono::high_resolution_clock::now() - t0).count();
+    kv.swap_bytes += (long long)mapped * BLOCK_BYTES;
+    ++kv.swap_outs;
+
+    kv.swapped.push_back(std::move(out));
+    return true;
+}
+
+// Restores swapped-out sequences, oldest first, into free slots. No prefill: the KV cache comes
+// back byte for byte, which is the whole point of the policy - the work already done is not
+// redone, only moved.
+void swapInSequences(SlotState &slots, KVCacheState &kv, DeviceBuffers &buf)
+{
+    if (kv.swapped.empty())
+    {
+        return;
+    }
+    const size_t slot_span = (size_t)N_LAYERS * MAX_BLOCKS_PER_SEQ;
+
+    for (int slot = 0; slot < BATCH_SIZE && !kv.swapped.empty(); ++slot)
+    {
+        if (!slots.is_slot_free[slot])
+        {
+            continue;
+        }
+        const SwappedSequence &in = kv.swapped.front();
+        int needed = 0;
+        for (int host_page : in.host_pages)
+        {
+            needed += (host_page != -1);
+        }
+        // One page per layer of headroom on top: a sequence restored with exactly enough pages
+        // and none to spare would be preempted straight back out by enforcePageBudget the moment
+        // it crosses a page boundary, and the run would measure that loop instead of recovery.
+        if ((int)kv.free_blocks.size() < needed + N_LAYERS)
+        {
+            return; // wait for pages to come back; FCFS, so nobody behind it goes first either
+        }
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (size_t i = 0; i < slot_span; ++i)
+        {
+            const int host_page = in.host_pages[i];
+            if (host_page == -1)
+            {
+                continue;
+            }
+            const int page = kvTakePage(kv);
+            cudaMemcpy((char *)kv.cache + (size_t)page * BLOCK_BYTES,
+                       (char *)kv.swap_host + (size_t)host_page * BLOCK_BYTES,
+                       BLOCK_BYTES, cudaMemcpyHostToDevice);
+            kv.block_table[(size_t)slot * slot_span + i] = page;
+            kv.swap_free_pages.push_back(host_page);
+        }
+        cudaMemcpy(kv.block_table_gpu + (size_t)slot * slot_span,
+                   kv.block_table.data() + (size_t)slot * slot_span,
+                   slot_span * sizeof(int), cudaMemcpyHostToDevice);
+        kv.swap_ms += std::chrono::duration<double, std::milli>(
+                          std::chrono::high_resolution_clock::now() - t0).count();
+        kv.swap_bytes += (long long)needed * BLOCK_BYTES;
+        ++kv.swap_ins;
+
+        slots.is_slot_free[slot] = false;
+        slots.slot_request_id[slot] = in.request_id;
+        slots.slot_seq_index[slot] = in.seq_index;
+        slots.remaining_budget[slot] = in.remaining_budget;
+        slots.current_prompt_len[slot] = in.context_len;
+        slots.last_generated_tokens[slot] = in.last_token;
+        slots.prompt_tokens[slot] = in.prompt_tokens;
+        slots.generated_tokens[slot] = in.generated_tokens;
+        // Still counts as a preempted sequence in flight, exactly as a recomputed one does, so
+        // finishSequence reopens admission when the last of them drains.
+        slots.was_preempted[slot] = true;
+        slots.decode_start[slot] = std::chrono::high_resolution_clock::now();
+
+        // The repetition-penalty bitmap belongs to the slot, not to the sequence, and this may
+        // not be the slot it left from. Clear it and replay the tokens this sequence has emitted,
+        // the same rebuild the recompute path does inside prefillBatch.
+        cudaMemset(buf.penalty_mask + (size_t)slot * VOCAB_SIZE, 0, VOCAB_SIZE);
+        const int generated = (int)in.generated_tokens.size();
+        if (generated > 0)
+        {
+            cudaMemcpy(buf.input_tokens, in.generated_tokens.data(), generated * sizeof(int),
+                       cudaMemcpyHostToDevice);
+            markTokenListKernel<<<(generated + 255) / 256, 256>>>(
+                buf.input_tokens, generated, slot, buf.penalty_mask);
+        }
+
+        json out_j;
+        out_j["type"] = "swapped_in";
+        out_j["id"] = in.request_id;
+        out_j["slot"] = slot;
+        out_j["seq"] = in.seq_index;
+        out_j["generated"] = generated;
+        std::cout << out_j.dump() << "\n" << std::flush;
+
+        kv.swapped.pop_front();
+    }
+}
+
 void preemptSequence(int slot, SlotState &slots, KVCacheState &kv, std::deque<Request> &queue)
 {
     const int request_id = slots.slot_request_id[slot];
     const int generated = (int)slots.generated_tokens[slot].size();
+
+    // §7.3 swap path. It has to run before anything below touches the pages, and it either
+    // takes the whole sequence (pages parked in host RAM, sequence parked in kv.swapped) or
+    // changes nothing at all and leaves the recompute path to deal with it.
+    if (g_preemption_policy == PreemptionPolicy::Swap)
+    {
+        if (swapOutSequence(slot, slots, kv))
+        {
+            json out_j;
+            out_j["type"] = "preempted";
+            out_j["id"] = request_id;
+            out_j["slot"] = slot;
+            out_j["seq"] = slots.slot_seq_index[slot];
+            out_j["generated"] = generated;
+            out_j["policy"] = "swap";
+            std::cout << out_j.dump() << "\n" << std::flush;
+
+            slots.is_slot_free[slot] = true;
+            slots.slot_request_id[slot] = -1;
+            ++kv.preemptions;
+            if (!slots.was_preempted[slot])
+            {
+                ++kv.preempted_in_flight;
+            }
+            slots.was_preempted[slot] = false;
+            kv.preemption_pending = true;
+            return;
+        }
+        ++kv.swap_fallbacks;
+    }
 
     // prompt + everything it has generated so far becomes the new prompt, which is why
     // recomputation is cheap: one prefill pass rebuilds the KV cache for every position at once.
     std::vector<int> tokens = slots.prompt_tokens[slot];
     tokens.insert(tokens.end(), slots.generated_tokens[slot].begin(), slots.generated_tokens[slot].end());
 
-    Request resumed{request_id, slots.remaining_budget[slot], std::move(tokens), generated};
+    // seq_index has to ride along: a preempted sequence that came back as answer 0 of its
+    // request would collide with its own sibling and draw from the wrong random stream.
+    Request resumed{request_id, slots.remaining_budget[slot], std::move(tokens), generated,
+                    slots.slot_seq_index[slot]};
 
     // Tell the client before the slot is recycled: this is not a completion and not a token, and
     // a harness that saw neither would think the request had vanished.
@@ -311,7 +688,9 @@ void preemptSequence(int slot, SlotState &slots, KVCacheState &kv, std::deque<Re
     out_j["type"] = "preempted";
     out_j["id"] = request_id;
     out_j["slot"] = slot;
+    out_j["seq"] = slots.slot_seq_index[slot];
     out_j["generated"] = generated;
+    out_j["policy"] = "recompute";
     std::cout << out_j.dump() << "\n" << std::flush;
 
     // hand the pages back
@@ -322,7 +701,7 @@ void preemptSequence(int slot, SlotState &slots, KVCacheState &kv, std::deque<Re
             int entry = slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx;
             if (kv.block_table[entry] != -1)
             {
-                kv.free_blocks.push_back(kv.block_table[entry]);
+                kvDropPage(kv, kv.block_table[entry]);
                 kv.block_table[entry] = -1;
             }
         }
@@ -391,6 +770,22 @@ void emitStepTelemetry(const SlotState &slots, const KVCacheState &kv, const std
     // and reporting it as a measured zero next to the baseline's non-zero count is the point.
     t["fragmentation_failures"] = 0;
     t["preemptions"] = kv.preemptions;
+    // §7.3. Zero under the recompute policy, so the field is harmless on every older run.
+    t["prefix_hits"] = kv.prefix_hits;
+    t["prefix_pinned_pages"] = kv.prefix_pinned_pages;
+    t["swapped_waiting"] = (int)kv.swapped.size();
+    t["swap_outs"] = kv.swap_outs;
+    t["swap_ins"] = kv.swap_ins;
+    t["swap_fallbacks"] = kv.swap_fallbacks;
+    t["swap_mb"] = (double)kv.swap_bytes / (double)B_TO_MB;
+    t["swap_ms"] = kv.swap_ms;
+    // §4.4 / Fig 15. kv_tokens_reserved above counts *distinct physical pages*, so sharing
+    // already shows up there as a smaller number. This is the other half of that sentence:
+    // how many extra block-table entries those pages are serving, i.e. the pages that did not
+    // have to exist. Identically zero without parallel sampling, and structurally impossible
+    // on the contiguous build.
+    t["shared_page_refs"] = kv.shared_page_refs;
+    t["kv_tokens_shared"] = (int)(kv.shared_page_refs * BLOCK_SIZE / N_LAYERS);
     std::cout << t.dump() << "\n" << std::flush;
 }
 
@@ -527,11 +922,33 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
         // ---- reserve every KV page the pass needs, for all prompts and all layers at once ----
         // Doing it up front means the layer loop only has to launch the scatter kernel, and
         // kv.block_table_gpu is synchronised exactly once per pass instead of once per page.
+        // Siblings of a parallel-sampling request do not need pages of their own - they will
+        // point at the leader's. Counting them here anyway would make admission demand n times
+        // the memory the pass actually consumes, which is exactly the cost sharing exists to
+        // avoid, and would show up as spurious "KV cache exhausted" deferrals.
         int pages_needed = 0;
-        for (size_t i = 0; i < pass_items.size(); ++i)
         {
-            int prompt_len = (int)items[pass_items[i]].tokens.size();
-            pages_needed += N_LAYERS * ((prompt_len + BLOCK_SIZE - 1) / BLOCK_SIZE);
+            std::unordered_map<long long, bool> counted;
+            for (size_t i = 0; i < pass_items.size(); ++i)
+            {
+                const PrefillBatchItem &item = items[pass_items[i]];
+                int prompt_len = (int)item.tokens.size();
+                const long long key = (long long)item.request_id * (MAX_SEQ_LEN + 1) + prompt_len;
+                if (!item.resumed_tokens && !counted.emplace(key, true).second)
+                {
+                    continue; // a sibling; the leader already paid for these pages
+                }
+                int blocks = (prompt_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                // §6.4: the whole-page part of a shared prefix is already in the pool, so a
+                // prompt carrying it needs pages only for what comes after. Counting them would
+                // make admission demand memory the pass never consumes - the same mistake the
+                // sibling check above avoids.
+                if (!item.resumed_tokens && promptCarriesPrefix(kv, item.tokens))
+                {
+                    blocks -= sharedPrefixBlocks();
+                }
+                pages_needed += N_LAYERS * blocks;
+            }
         }
         if ((int)kv.free_blocks.size() < pages_needed)
         {
@@ -570,8 +987,10 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
                 if (anything_running)
                 {
                     std::lock_guard<std::mutex> lock(g_queue_mutex);
+                    // ...and the same on the deferral path, for the same reason
                     queue.push_front({items[i].request_id, items[i].max_tokens,
-                                      std::move(items[i].tokens), items[i].resumed_tokens});
+                                      std::move(items[i].tokens), items[i].resumed_tokens,
+                                      items[i].seq_index});
                 }
                 else
                 {
@@ -581,11 +1000,47 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
             return;
         }
 
+        // §4.4. The n answers to one prompt have, by construction, identical KV for every
+        // prompt position - same tokens, same weights. So the later ones do not get their own
+        // pages: they point at the leader's and bump its refcount. This is the entire memory
+        // saving of parallel sampling, and it is the one thing the contiguous baseline cannot
+        // do at all, because there a sequence *is* its own contiguous run.
+        //
+        // Leaders are identified within this pass only. Siblings admitted in different passes
+        // simply do not share, which costs memory but can never be wrong; sharing across passes
+        // would mean reaching into a sequence that is already decoding and whose last page is
+        // no longer identical to the prompt.
+        std::unordered_map<long long, size_t> leader_of;  // (request_id, prompt_len) -> pass index
         for (size_t i = 0; i < pass_items.size(); ++i)
         {
-            int slot = items[pass_items[i]].slot;
-            int prompt_len = (int)items[pass_items[i]].tokens.size();
+            const PrefillBatchItem &item = items[pass_items[i]];
+            int slot = item.slot;
+            int prompt_len = (int)item.tokens.size();
             int num_pages = (prompt_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+            // A resumed sequence's "prompt" is prompt + what it had generated, which is its own
+            // and is not shared with anybody; keying on the length keeps it out of the map.
+            const long long key = (long long)item.request_id * (MAX_SEQ_LEN + 1) + prompt_len;
+            auto found = item.resumed_tokens ? leader_of.end() : leader_of.find(key);
+            const bool share = found != leader_of.end();
+            const int leader_slot = share ? items[pass_items[found->second]].slot : -1;
+
+            // §6.4, two cases. `use_prefix`: the registry exists and this prompt starts with it,
+            // so its first pages are the registry's and cost nothing. `establish`: the registry
+            // does not exist yet and this prompt is long enough to found it - it allocates and
+            // fills those pages as usual, and they are then pinned for the rest of the run.
+            //
+            // Establishing from a request instead of precomputing the prefix at startup is a
+            // deliberate simplification: the prefix is defined by the traffic, which is how the
+            // workload file defines it too (meta.shared_prefix_tokens is measured, not declared).
+            // The first request therefore pays full price, and every later one does not.
+            const int prefix_blocks = sharedPrefixBlocks();
+            const bool use_prefix = !share && !item.resumed_tokens
+                                    && promptCarriesPrefix(kv, item.tokens);
+            const bool establish = !share && !item.resumed_tokens && !use_prefix
+                                   && prefix_blocks > 0 && kv.prefix_tokens.empty()
+                                   && num_pages >= prefix_blocks;
+
             for (int layer = 0; layer < N_LAYERS; ++layer)
             {
                 for (int logical_block_idx = 0; logical_block_idx < num_pages; ++logical_block_idx)
@@ -594,9 +1049,55 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
                     // slots are released (and their pages returned) when a sequence finishes,
                     // so everything we touch here must still be unmapped
                     assert(kv.block_table[entry] == -1 && "page must be free before prefill - what happened?");
-                    kv.block_table[entry] = kv.free_blocks.back();
-                    kv.free_blocks.pop_back();
+                    if (share)
+                    {
+                        const int leader_entry = leader_slot * N_LAYERS * MAX_BLOCKS_PER_SEQ
+                                                 + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx;
+                        kv.block_table[entry] = kv.block_table[leader_entry];
+                        kvSharePage(kv, kv.block_table[entry]);
+                    }
+                    else if (use_prefix && logical_block_idx < prefix_blocks)
+                    {
+                        kv.block_table[entry] = kv.prefix_pages[(size_t)layer * prefix_blocks + logical_block_idx];
+                        kvSharePage(kv, kv.block_table[entry]);
+                    }
+                    else
+                    {
+                        kv.block_table[entry] = kvTakePage(kv);
+                    }
                 }
+            }
+            if (use_prefix)
+            {
+                ++kv.prefix_hits;
+            }
+            if (establish)
+            {
+                // The pages are filled by the prefill pass below, with the same tokens at the
+                // same positions every later request would have produced, so the bytes a sharer
+                // reads are the bytes it would have computed. The extra refcount is the pin: it
+                // is never dropped, so finishSequence returning this sequence's pages leaves the
+                // registry's alive.
+                for (int layer = 0; layer < N_LAYERS; ++layer)
+                {
+                    for (int logical_block_idx = 0; logical_block_idx < prefix_blocks; ++logical_block_idx)
+                    {
+                        const int entry = slot * N_LAYERS * MAX_BLOCKS_PER_SEQ
+                                          + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx;
+                        const int page = kv.block_table[entry];
+                        kv.prefix_pages[(size_t)layer * prefix_blocks + logical_block_idx] = page;
+                        ++kv.block_refcount[page];
+                    }
+                }
+                kv.prefix_pinned_pages = (long long)N_LAYERS * prefix_blocks;
+                kv.prefix_tokens.assign(item.tokens.begin(),
+                                        item.tokens.begin() + (size_t)prefix_blocks * BLOCK_SIZE);
+                std::cerr << "Shared prefix registered: " << kv.prefix_tokens.size()
+                          << " tokens = " << kv.prefix_pinned_pages << " pinned pages\n";
+            }
+            if (!share && !item.resumed_tokens)
+            {
+                leader_of.emplace(key, i);
             }
         }
         cudaMemcpy(kv.block_table_gpu, kv.block_table.data(), MAX_SEQUENCES * N_LAYERS * MAX_BLOCKS_PER_SEQ * sizeof(int), cudaMemcpyHostToDevice);
@@ -871,10 +1372,19 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
         // Greedy sampling on the device, so the only thing that crosses PCIe is one token id
         // per prompt. No penalty mask here: a prompt being prefilled has emitted nothing yet,
         // which is exactly what the host-side scan did (it never applied the penalty either).
-        argmaxPartialKernel<<<dim3(ARGMAX_CHUNKS_PER_ROW, num_seqs), ARGMAX_BLOCK_THREADS>>>(
-            buf.embed_proj, num_seqs, nullptr, nullptr, buf.argmax_values, buf.argmax_indices);
-        argmaxFinalizeKernel<<<num_seqs, ARGMAX_CHUNKS_PER_ROW>>>(
-            buf.argmax_values, buf.argmax_indices, num_seqs, buf.sampled_tokens);
+        // Each prompt's first token draws from its own stream, at the position it is about to
+        // occupy, so a sequence that is later preempted and recomputed redraws exactly the same
+        // token instead of silently forking onto a different continuation.
+        std::vector<int> rng_keys(num_seqs), rng_positions(num_seqs);
+        for (int seq = 0; seq < num_seqs; ++seq)
+        {
+            const PrefillBatchItem &it = items[pass_items[seq]];
+            // The n answers to one prompt must draw from *different* streams, or parallel
+            // sampling silently returns the same text n times.
+            rng_keys[seq] = it.request_id * MAX_PARALLEL_SEQUENCES + it.seq_index;
+            rng_positions[seq] = (int)it.tokens.size();
+        }
+        sampleTokens(buf, num_seqs, nullptr, nullptr, rng_keys, rng_positions);
         // the first generated token counts towards the repetition penalty of the steps that
         // follow, same as when the host pushed it into generated_tokens
         markSampledTokensKernel<<<1, BATCH_SIZE>>>(buf.sampled_tokens, buf.logit_row_slots, num_seqs, buf.penalty_mask);
@@ -903,6 +1413,7 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
                 json out_j;
                 out_j["id"] = request_id;
                 out_j["slot"] = slot;
+                out_j["seq"] = slots.slot_seq_index[slot];
                 // the id itself, so the benchmark can checksum a request's output and show
                 // that the two cache designs are numerically identical, not just equally fast
                 out_j["tok"] = max_token_idx;
@@ -928,6 +1439,11 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
             stat_j["prompt_tokens"] = prompt_len;
             stat_j["batch_tokens"] = num_tokens;
             stat_j["batch_prompts"] = num_seqs;
+            // Non-zero marks this pass as a *recomputation*: the sequence was preempted, its
+            // pages were handed back, and prompt + everything it had already generated is being
+            // prefilled again. That is the entire cost of recovery-by-recompute, and without
+            // this field it is indistinguishable from an ordinary first prefill. §7.3.
+            stat_j["resumed_tokens"] = items[pass_items[seq]].resumed_tokens;
             std::cout << stat_j.dump() << "\n" << std::flush;
 
             // A prompt whose first sampled token is already EOS is finished here. Letting it
@@ -1003,17 +1519,50 @@ int decodeStep(DeviceBuffers &buf,
     for (int row = 0; row < num_active_slots; ++row)
     {
         int slot = active_slots[row];
-        if (positions[row] % BLOCK_SIZE != 0)
-        {
-            continue; // still inside the page it is already using
-        }
         int logical_block_idx = positions[row] / BLOCK_SIZE;
-        for (int layer = 0; layer < N_LAYERS; ++layer)
+        bool table_changed = false;
+
+        if (positions[row] % BLOCK_SIZE == 0)
         {
-            int entry = slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx;
-            assert(kv.block_table[entry] == -1 && "page must be unmapped before decode maps it");
-            kv.block_table[entry] = kv.free_blocks.back();
-            kv.free_blocks.pop_back();
+            for (int layer = 0; layer < N_LAYERS; ++layer)
+            {
+                int entry = slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx;
+                assert(kv.block_table[entry] == -1 && "page must be unmapped before decode maps it");
+                kv.block_table[entry] = kvTakePage(kv);
+            }
+            table_changed = true;
+        }
+        else
+        {
+            // Copy-on-write (§4.4). This row is about to write its new token into a page it is
+            // already using - and if that page came from sharing a sibling's prompt, writing
+            // into it would overwrite the sibling's view of its own cache. The corruption would
+            // be silent: both sequences keep producing plausible text, just not their own.
+            //
+            // Only the last page of a sequence can be in this state (every earlier one is full
+            // and never written again), so this is at most N_LAYERS page copies, once, per
+            // sequence that was sharing.
+            for (int layer = 0; layer < N_LAYERS; ++layer)
+            {
+                int entry = slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx;
+                const int page = kv.block_table[entry];
+                if (page < 0 || kv.block_refcount[page] <= 1)
+                {
+                    continue; // sole owner: write in place, which is the ordinary case
+                }
+                const int fresh = kvTakePage(kv);
+                cudaMemcpy((char *)kv.cache + (size_t)fresh * BLOCK_BYTES,
+                           (char *)kv.cache + (size_t)page * BLOCK_BYTES,
+                           BLOCK_BYTES, cudaMemcpyDeviceToDevice);
+                kvDropPage(kv, page);
+                kv.block_table[entry] = fresh;
+                table_changed = true;
+            }
+        }
+
+        if (!table_changed)
+        {
+            continue;
         }
         // One slot's entries are contiguous (N_LAYERS * MAX_BLOCKS_PER_SEQ ints = 8 KiB), so a
         // slot that got pages costs one memcpy of its own row block, not a full-table upload.
@@ -1246,11 +1795,16 @@ int decodeStep(DeviceBuffers &buf,
     // VOCAB_SIZE bf16->float conversion into a fresh std::vector plus a serial scan, i.e.
     // ~4M elements touched three times on one core while the GPU sat idle. buf.active_slots
     // already holds the slot that owns each logits row, so it doubles as the mask index.
-    argmaxPartialKernel<<<dim3(ARGMAX_CHUNKS_PER_ROW, num_active_slots), ARGMAX_BLOCK_THREADS>>>(
-        buf.embed_proj, num_active_slots, buf.penalty_mask, buf.active_slots,
-        buf.argmax_values, buf.argmax_indices);
-    argmaxFinalizeKernel<<<num_active_slots, ARGMAX_CHUNKS_PER_ROW>>>(
-        buf.argmax_values, buf.argmax_indices, num_active_slots, buf.sampled_tokens);
+    std::vector<int> rng_keys(num_active_slots), rng_positions(num_active_slots);
+    for (int row = 0; row < num_active_slots; ++row)
+    {
+        const int s = active_slots[row];
+        rng_keys[row] = slots.slot_request_id[s] * MAX_PARALLEL_SEQUENCES
+                        + slots.slot_seq_index[s];
+        rng_positions[row] = slots.current_prompt_len[s];
+    }
+    sampleTokens(buf, num_active_slots, buf.penalty_mask, buf.active_slots,
+                 rng_keys, rng_positions);
     markSampledTokensKernel<<<1, BATCH_SIZE>>>(buf.sampled_tokens, buf.active_slots, num_active_slots, buf.penalty_mask);
 
     std::vector<int> sampled(num_active_slots);
@@ -1268,6 +1822,7 @@ int decodeStep(DeviceBuffers &buf,
             json out_j;
             out_j["id"] = request_id;
             out_j["slot"] = active_slot;
+            out_j["seq"] = slots.slot_seq_index[active_slot];
             out_j["tok"] = max_token_idx;
             std::cout << out_j.dump() << "\n" << std::flush;
         }

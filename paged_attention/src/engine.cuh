@@ -20,6 +20,7 @@ struct PrefillBatchItem
     int request_id;
     int max_tokens;     // output budget still owed to this request
     int resumed_tokens; // non-zero only for a sequence being recomputed after preemption
+    int seq_index;      // which answer of a parallel-sampling request this is; 0 otherwise
     std::vector<int> tokens;
 };
 
@@ -60,6 +61,13 @@ struct DeviceBuffers
     float *argmax_values;     // [BATCH_SIZE, ARGMAX_CHUNKS_PER_ROW] first-pass partials
     int *argmax_indices;      // [BATCH_SIZE, ARGMAX_CHUNKS_PER_ROW]
     int *sampled_tokens;      // [BATCH_SIZE] the only thing the host reads back per step
+    // Random sampling (§6.3). Allocated unconditionally - about 4 KiB at BATCH_SIZE 384 -
+    // because making them conditional would make the greedy and sampled builds disagree on
+    // how much VRAM is left, and the KV pool is exactly "whatever is left".
+    float *row_max;           // [BATCH_SIZE] stable-softmax shift, one per logits row
+    float *exp_sums;          // [BATCH_SIZE, ARGMAX_CHUNKS_PER_ROW] second-pass partials
+    int *rng_keys;            // [BATCH_SIZE] which random stream this row draws from
+    int *rng_positions;       // [BATCH_SIZE] how far along that stream it is
     // Repetition penalty state: one byte per (slot, token), 1 once the sequence has emitted
     // that token. Replaces re-deriving the set from generated_tokens on the host every step.
     unsigned char *penalty_mask; // [BATCH_SIZE, VOCAB_SIZE]
@@ -75,6 +83,10 @@ struct SlotState
     std::vector<int> last_generated_tokens;           // token to feed back in the next step
     std::vector<int> current_prompt_len;              // tokens already in the KV cache
     std::vector<int> slot_request_id;                 // which request owns the slot, -1 if none
+    // Which of that request's answers this slot is producing (§6.3). Always 0 outside parallel
+    // sampling. It is carried separately from the request id because several slots legitimately
+    // share an id, and every message the engine emits has to say which one it is about.
+    std::vector<int> slot_seq_index;
     std::vector<int> remaining_budget;                // output tokens the request may still get
     // The prompt as it arrived, kept for the whole sequence's life. A preempted sequence is
     // recomputed from prompt + what it had already generated, so the prompt has to survive the
@@ -91,12 +103,49 @@ struct SlotState
 // The paged KV cache and the page table that maps (slot, layer, logical page) to a physical
 // page. The table is kept on both sides: the host allocates pages into `block_table` and
 // uploads it to `block_table_gpu` for the attention kernels to walk.
+// §7.3. Two ways to recover a sequence whose pages were taken away: rebuild its KV cache with
+// one prefill pass (Recompute), or keep the pages' contents in host RAM and copy them back when
+// the pool has room (Swap). Recompute is the default, so every result produced before the swap
+// path existed still means what it meant.
+enum class PreemptionPolicy
+{
+    Recompute,
+    Swap
+};
+extern PreemptionPolicy g_preemption_policy;
+
+// A sequence whose pages live in host RAM right now. It is NOT in the request queue: unlike a
+// recomputed sequence it never goes back through prefill, so it has to carry everything a decode
+// slot holds - the tokens it has emitted, how much budget is left, how long its context is - and
+// be restored straight into a slot by swapInSequences().
+struct SwappedSequence
+{
+    int request_id;
+    int seq_index;
+    int remaining_budget;
+    int context_len;   // current_prompt_len at the moment it was swapped out
+    int last_token;    // the token the next decode step feeds back in
+    std::vector<int> prompt_tokens;
+    std::vector<int> generated_tokens;
+    // Host page holding each (layer, logical page) of this sequence, -1 where it was unmapped.
+    // Same layout as one slot's rows of block_table, so the two map onto each other directly.
+    std::vector<int> host_pages;
+};
+
 struct KVCacheState
 {
     __nv_bfloat16 *cache;          // NUM_BLOCKS pages of BLOCK_BYTES
     std::vector<int> block_table;  // [MAX_SEQUENCES * N_LAYERS * MAX_BLOCKS_PER_SEQ], -1 = unmapped
     int *block_table_gpu;          // device mirror of block_table
     std::vector<int> free_blocks;  // physical pages nobody holds
+    // How many block-table entries point at each physical page (§4.4). One for an ordinary
+    // page; more once the answers to a parallel-sampling request share their prompt's pages.
+    // A page only goes back on free_blocks when this reaches zero, which is the single
+    // invariant the whole sharing scheme rests on - release a shared page early and the
+    // sibling still reading it gets another sequence's tokens.
+    std::vector<int> block_refcount;
+    // Pages that exist once but are pointed at more than once, i.e. the saving. Fig 15.
+    long long shared_page_refs;
     long long preemptions;         // sequences sent back for recomputation
     // True from the moment a sequence is preempted until every preempted sequence has finished.
     // §4.5: "Once it preempts a sequence and evicts its blocks, vLLM stops accepting new requests
@@ -105,7 +154,34 @@ struct KVCacheState
     // latency numbers would measure that loop instead of paging.
     bool preemption_pending;
     int preempted_in_flight;       // how many are still working their way back out
+    // ---- swap-to-host state, only touched under PreemptionPolicy::Swap ----
+    __nv_bfloat16 *swap_host;          // pinned host pages, SWAP_HOST_BYTES / BLOCK_BYTES of them
+    std::vector<int> swap_free_pages;  // host pages nobody holds
+    std::deque<SwappedSequence> swapped; // FIFO: oldest swapped-out sequence comes back first
+    long long swap_outs;               // sequences pushed to host
+    long long swap_ins;                // sequences pulled back
+    // Times the swap policy could not swap and recomputed instead. Reported rather than hidden:
+    // a run where this is ~100% is measuring recompute under a different name, and reading it as
+    // "swap is slow" would be wrong. See the gate in plan 5.
+    long long swap_fallbacks;
+    long long swap_bytes;              // total moved in both directions
+    double swap_ms;                    // wall time spent inside the copies
+    // ---- §6.4 shared prefix ----
+    // "In vLLM, this can be conveniently achieved by reserving a set of physical blocks for a
+    // set of predefined shared prefixes by the LLM service provider, as how OS handles shared
+    // library across processes." The registry is those reserved pages: one row of
+    // (layer, logical block) covering the whole-page part of the prefix, pinned for the run.
+    std::vector<int> prefix_pages;   // [N_LAYERS * prefix_blocks], -1 until established
+    std::vector<int> prefix_tokens;  // the prefix itself, so a prompt can be checked against it
+    long long prefix_hits;           // prompts that mapped the registry instead of paying for it
+    long long prefix_pinned_pages;   // size of the registry, i.e. the memory it costs once
 };
+
+// How many whole pages of the configured shared prefix can be shared, and whether a prompt
+// actually carries that prefix. Zero unless SHARED_PREFIX_LEN is set, which is every experiment
+// outside §6.4.
+extern int g_shared_prefix_len;
+int sharedPrefixBlocks();
 
 // Takes a running sequence's pages back and returns it to the front of the queue to be recomputed
 // from prompt + the tokens it had already generated. §4.5: "we simply recompute the KV cache when
@@ -113,6 +189,15 @@ struct KVCacheState
 // one prompt phase iteration." Front of the queue because scheduling is FCFS and this request
 // arrived before anything still waiting.
 void preemptSequence(int slot, SlotState &slots, KVCacheState &kv, std::deque<Request> &queue);
+
+// True while the page pool adds up: free pages have refcount 0, held pages have refcount > 0,
+// and the two sets together are every page exactly once. See the call site in main.cu.
+bool kvPageAccountingHolds(const KVCacheState &kv);
+
+// Puts swapped-out sequences back into free slots, pages and all, without a prefill pass. Called
+// at the top of the step loop, before new prompts are admitted: a sequence already in flight has
+// arrived earlier than anything still queued, and FCFS says it goes first.
+void swapInSequences(SlotState &slots, KVCacheState &kv, DeviceBuffers &buf);
 
 // How many requests are batched right now, how much of the pool is mapped, and how much of what
 // is mapped holds a real token. One JSON line every STEP_TELEMETRY_EVERY decode steps; the
@@ -122,6 +207,14 @@ void emitStepTelemetry(const SlotState &slots, const KVCacheState &kv, const std
 
 // Set from the IGNORE_EOS environment variable; see engine.cu.
 extern bool g_ignore_eos;
+extern float g_temperature;
+extern unsigned int g_sampling_seed;
+
+// One sampling entry point for both prefill and decode. rng_keys/rng_positions are read only
+// when g_temperature > 0; under greedy they are ignored and may hold anything.
+void sampleTokens(DeviceBuffers &buf, int num_rows, const unsigned char *penalty_mask,
+                  const int *row_slot_ids, const std::vector<int> &rng_keys,
+                  const std::vector<int> &rng_positions);
 
 // ---- startup ----
 

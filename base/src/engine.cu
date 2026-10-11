@@ -19,6 +19,12 @@ using json = nlohmann::json;
 // the same number of tokens in every build, so the two engines do identical work and the
 // "oracle" reservation policy really is an oracle rather than an estimate.
 bool g_ignore_eos = false;
+// 0 means greedy, which stays the default: every experiment before §6.3 depends on the engine
+// being deterministic, and the checksum gate that proves the two builds agree depends on it
+// absolutely. Sampling is opt-in per run via TEMPERATURE.
+float g_temperature = 0.0f;
+int g_shared_prefix_len = 0;   // §6.4, reported only; see reportEngineConfig()
+unsigned int g_sampling_seed = 0;
 
 // Set from the ORCA_POLICY environment variable at startup; see config.h for what the
 // three policies mean and why all three are worth measuring.
@@ -47,6 +53,7 @@ SlotState::SlotState()
       last_generated_tokens(BATCH_SIZE),
       current_prompt_len(BATCH_SIZE, 0),
       slot_request_id(BATCH_SIZE, -1),
+      slot_seq_index(BATCH_SIZE, 0),
       remaining_budget(BATCH_SIZE, 0),
       decode_start(BATCH_SIZE)
 {
@@ -104,10 +111,50 @@ DeviceBuffers allocateDeviceBuffers()
     buf.argmax_values = (float *)allocDevice(BATCH_SIZE * ARGMAX_CHUNKS_PER_ROW * sizeof(float), "argmax values");
     buf.argmax_indices = (int *)allocDevice(BATCH_SIZE * ARGMAX_CHUNKS_PER_ROW * sizeof(int), "argmax indices");
     buf.sampled_tokens = (int *)allocDevice(BATCH_SIZE * sizeof(int), "sampled tokens");
+    buf.row_max = (float *)allocDevice(BATCH_SIZE * sizeof(float), "sampling row max");
+    buf.exp_sums = (float *)allocDevice(BATCH_SIZE * ARGMAX_CHUNKS_PER_ROW * sizeof(float), "sampling exp sums");
+    buf.rng_keys = (int *)allocDevice(BATCH_SIZE * sizeof(int), "sampling rng keys");
+    buf.rng_positions = (int *)allocDevice(BATCH_SIZE * sizeof(int), "sampling rng positions");
     buf.penalty_mask = (unsigned char *)allocDevice((size_t)BATCH_SIZE * VOCAB_SIZE, "repetition penalty mask");
     cudaMemset(buf.penalty_mask, 0, (size_t)BATCH_SIZE * VOCAB_SIZE);
 
     return buf;
+}
+
+// Greedy or sampled, through one entry point, because prefill and decode both have to make the
+// choice and any drift between them would show up as a sequence whose first token obeyed a
+// different policy than the rest of it.
+//
+// The greedy path is byte-for-byte what it was: argmax partial + finalize. The sampled path
+// reuses that same first pass - its per-chunk maxima are exactly the shift a stable softmax
+// needs - and adds two more. Nothing below the early return runs while g_temperature is 0,
+// which is the default and what every experiment before §6.3 relies on.
+void sampleTokens(DeviceBuffers &buf, int num_rows, const unsigned char *penalty_mask,
+                  const int *row_slot_ids, const std::vector<int> &rng_keys,
+                  const std::vector<int> &rng_positions)
+{
+    argmaxPartialKernel<<<dim3(ARGMAX_CHUNKS_PER_ROW, num_rows), ARGMAX_BLOCK_THREADS>>>(
+        buf.embed_proj, num_rows, penalty_mask, row_slot_ids,
+        buf.argmax_values, buf.argmax_indices);
+
+    if (g_temperature <= 0.0f)
+    {
+        argmaxFinalizeKernel<<<num_rows, ARGMAX_CHUNKS_PER_ROW>>>(
+            buf.argmax_values, buf.argmax_indices, num_rows, buf.sampled_tokens);
+        return;
+    }
+
+    cudaMemcpy(buf.rng_keys, rng_keys.data(), num_rows * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(buf.rng_positions, rng_positions.data(), num_rows * sizeof(int),
+               cudaMemcpyHostToDevice);
+
+    const float inv_t = 1.0f / g_temperature;
+    rowMaxKernel<<<num_rows, ARGMAX_CHUNKS_PER_ROW>>>(buf.argmax_values, num_rows, buf.row_max);
+    expSumPartialKernel<<<dim3(ARGMAX_CHUNKS_PER_ROW, num_rows), ARGMAX_BLOCK_THREADS>>>(
+        buf.embed_proj, num_rows, penalty_mask, row_slot_ids, buf.row_max, inv_t, buf.exp_sums);
+    sampleFinalizeKernel<<<num_rows, ARGMAX_BLOCK_THREADS>>>(
+        buf.embed_proj, num_rows, penalty_mask, row_slot_ids, buf.row_max, buf.exp_sums,
+        inv_t, g_sampling_seed, buf.rng_keys, buf.rng_positions, buf.sampled_tokens);
 }
 
 int g_kv_pool_tokens = 0;
@@ -346,6 +393,16 @@ void reportEngineConfig()
     config_j["max_batch_tokens"] = MAX_BATCH_TOKENS;
     config_j["max_prompt_len"] = MAX_PROMPT_LEN;
     config_j["max_new_tokens"] = MAX_NEW_TOKENS_GENERATED;
+    // So a result file carries the sampler it was produced under. Two runs with different
+    // temperatures are not comparable, and without this the difference would be invisible
+    // after the fact.
+    // §6.4. Reported, never acted on: a contiguous reservation is one run of memory belonging to
+    // one sequence, so there is no way for two sequences to point at the same prefix - which is
+    // the experiment. The field is here so a baseline run and a paged run carry the same label
+    // and cannot be mixed up after the fact.
+    config_j["shared_prefix_len"] = g_shared_prefix_len;
+    config_j["temperature"] = g_temperature;
+    config_j["sampling_seed"] = (int)g_sampling_seed;
     config_j["reserve_policy"] = reservePolicyName();
     config_j["kv_pool_tokens"] = g_kv_pool_tokens;
     std::cout << config_j.dump() << "\n" << std::flush;
@@ -395,7 +452,9 @@ std::vector<PrefillBatchItem> admitQueuedRequests(std::deque<Request> &queue, Sl
         // first token, or a failure) still reports a sane duration instead of whatever
         // the previous owner of this slot left behind
         slots.decode_start[slot] = std::chrono::high_resolution_clock::now();
-        items.push_back({slot, request.id, request.max_tokens, 0, std::move(request.tokens)});
+        slots.slot_seq_index[slot] = request.seq_index;
+        items.push_back({slot, request.id, request.max_tokens, 0, request.seq_index,
+                         std::move(request.tokens)});
     }
     if (!items.empty())
     {
@@ -413,6 +472,7 @@ void finishSequence(int slot, int request_id, const char *error, SlotState &slot
     json done_j;
     done_j["id"] = request_id;
     done_j["slot"] = slot;
+    done_j["seq"] = slots.slot_seq_index[slot];
     done_j["done"] = true;
     done_j["tokens"] = tokens;
     done_j["decode_time"] = decode_ms;
@@ -832,10 +892,19 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
         // Greedy sampling on the device, so the only thing that crosses PCIe is one token id
         // per prompt. No penalty mask here: a prompt being prefilled has emitted nothing yet,
         // which is exactly what the host-side scan did (it never applied the penalty either).
-        argmaxPartialKernel<<<dim3(ARGMAX_CHUNKS_PER_ROW, num_seqs), ARGMAX_BLOCK_THREADS>>>(
-            buf.embed_proj, num_seqs, nullptr, nullptr, buf.argmax_values, buf.argmax_indices);
-        argmaxFinalizeKernel<<<num_seqs, ARGMAX_CHUNKS_PER_ROW>>>(
-            buf.argmax_values, buf.argmax_indices, num_seqs, buf.sampled_tokens);
+        // Each prompt's first token draws from its own stream, at the position it is about to
+        // occupy, so a sequence that is later preempted and recomputed redraws exactly the same
+        // token instead of silently forking onto a different continuation.
+        std::vector<int> rng_keys(num_seqs), rng_positions(num_seqs);
+        for (int seq = 0; seq < num_seqs; ++seq)
+        {
+            const PrefillBatchItem &it = items[pass_items[seq]];
+            // The n answers to one prompt must draw from *different* streams, or parallel
+            // sampling silently returns the same text n times.
+            rng_keys[seq] = it.request_id * MAX_PARALLEL_SEQUENCES + it.seq_index;
+            rng_positions[seq] = (int)it.tokens.size();
+        }
+        sampleTokens(buf, num_seqs, nullptr, nullptr, rng_keys, rng_positions);
         // the first generated token counts towards the repetition penalty of the steps that
         // follow, same as when the host pushed it into generated_tokens
         markSampledTokensKernel<<<1, BATCH_SIZE>>>(buf.sampled_tokens, buf.logit_row_slots, num_seqs, buf.penalty_mask);
@@ -864,6 +933,7 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
                 json out_j;
                 out_j["id"] = request_id;
                 out_j["slot"] = slot;
+                out_j["seq"] = slots.slot_seq_index[slot];
                 // the id itself, so the benchmark can checksum a request's output and show
                 // that the two cache designs are numerically identical, not just equally fast
                 out_j["tok"] = max_token_idx;
@@ -889,6 +959,11 @@ void prefillBatch(std::vector<PrefillBatchItem> &items,
             stat_j["prompt_tokens"] = prompt_len;
             stat_j["batch_tokens"] = num_tokens;
             stat_j["batch_prompts"] = num_seqs;
+            // Always zero here, and emitted anyway so the two builds speak the same protocol.
+            // A reservation-based cache never preempts: it refuses a request at admission
+            // rather than taking it in and clawing the memory back later. The field being
+            // identically zero on this side is the measurement, not a gap in it. §7.3.
+            stat_j["resumed_tokens"] = items[pass_items[seq]].resumed_tokens;
             std::cout << stat_j.dump() << "\n" << std::flush;
 
             // A prompt whose first sampled token is already EOS is finished here. Letting it
@@ -1182,11 +1257,16 @@ int decodeStep(DeviceBuffers &buf,
     // VOCAB_SIZE bf16->float conversion into a fresh std::vector plus a serial scan, i.e.
     // ~4M elements touched three times on one core while the GPU sat idle. buf.active_slots
     // already holds the slot that owns each logits row, so it doubles as the mask index.
-    argmaxPartialKernel<<<dim3(ARGMAX_CHUNKS_PER_ROW, num_active_slots), ARGMAX_BLOCK_THREADS>>>(
-        buf.embed_proj, num_active_slots, buf.penalty_mask, buf.active_slots,
-        buf.argmax_values, buf.argmax_indices);
-    argmaxFinalizeKernel<<<num_active_slots, ARGMAX_CHUNKS_PER_ROW>>>(
-        buf.argmax_values, buf.argmax_indices, num_active_slots, buf.sampled_tokens);
+    std::vector<int> rng_keys(num_active_slots), rng_positions(num_active_slots);
+    for (int row = 0; row < num_active_slots; ++row)
+    {
+        const int s = active_slots[row];
+        rng_keys[row] = slots.slot_request_id[s] * MAX_PARALLEL_SEQUENCES
+                        + slots.slot_seq_index[s];
+        rng_positions[row] = slots.current_prompt_len[s];
+    }
+    sampleTokens(buf, num_active_slots, buf.penalty_mask, buf.active_slots,
+                 rng_keys, rng_positions);
     markSampledTokensKernel<<<1, BATCH_SIZE>>>(buf.sampled_tokens, buf.active_slots, num_active_slots, buf.penalty_mask);
 
     std::vector<int> sampled(num_active_slots);
@@ -1204,6 +1284,7 @@ int decodeStep(DeviceBuffers &buf,
             json out_j;
             out_j["id"] = request_id;
             out_j["slot"] = active_slot;
+            out_j["seq"] = slots.slot_seq_index[active_slot];
             out_j["tok"] = max_token_idx;
             std::cout << out_j.dump() << "\n" << std::flush;
         }

@@ -54,6 +54,35 @@ int main(int argc, char *argv[])
         g_ignore_eos = (ignore_eos[0] == '1');
     }
 
+    // TEMPERATURE unset or 0 keeps greedy decoding, which every experiment before §6.3 needs:
+    // the equivalence gate between the two builds is a checksum over the generated ids, and a
+    // sampler would make that gate meaningless. A value > 0 turns on random sampling, and then
+    // SAMPLING_SEED is what makes a run reproducible - the draw is a pure function of
+    // (seed, request id, position), never of a running generator state.
+    if (const char *temp = std::getenv("TEMPERATURE"))
+    {
+        g_temperature = (float)atof(temp);
+        if (g_temperature < 0.0f)
+        {
+            g_temperature = 0.0f;
+        }
+    }
+    // §6.4: recorded so a baseline run is labelled with the same prefix length as the paged run
+    // it is compared against. Nothing in this build can act on it.
+    if (const char *prefix = std::getenv("SHARED_PREFIX_LEN"))
+    {
+        g_shared_prefix_len = atoi(prefix);
+    }
+    if (const char *seed = std::getenv("SAMPLING_SEED"))
+    {
+        g_sampling_seed = (unsigned int)strtoul(seed, nullptr, 10);
+    }
+    if (g_temperature > 0.0f)
+    {
+        std::cerr << "Sampling: temperature " << g_temperature
+                  << ", seed " << g_sampling_seed << " (greedy decoding is OFF)\n";
+    }
+
     // Which reservation policy this run is the baseline for. See config.h: "max" is the
     // only one a real contiguous engine can implement, "oracle" is the unreachable lower
     // bound on reservation waste, "pow2" sits between them. The paper measures all three.

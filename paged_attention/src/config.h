@@ -85,6 +85,11 @@ constexpr float REPETITION_PENALTY = 1.15f;
 // Worst-case lifetime footprint of one sequence, in tokens of context. Both builds need it: the
 // baseline reserves against it, the paged build sizes its block table by it.
 constexpr int MAX_TOKENS_PER_SEQUENCE = MAX_PROMPT_LEN + MAX_NEW_TOKENS_GENERATED;
+
+// §6.3 asks the engine for several answers to one prompt. The wire format carries the count,
+// so this is also a guard: the field used to be the first token id, and a client that was not
+// updated would otherwise ask for 128000 sequences and the engine would try.
+constexpr int MAX_PARALLEL_SEQUENCES = 8;
 static_assert(MAX_TOKENS_PER_SEQUENCE <= MAX_SEQ_LEN,
               "the RoPE tables only cover MAX_SEQ_LEN positions");
 
@@ -216,3 +221,17 @@ constexpr int MAX_PREFILL_ATTN_TILES = MAX_BATCH_TOKENS / PREFILL_ATTN_QUERIES_P
 // paged_attention/, hence the "../". Override with the MODEL_DIR env var or by passing the
 // directory as the first program argument.
 constexpr const char *DEFAULT_MODEL_DIR = "../models/Llama-3.2-1B-Instruct";
+
+// ---- §7.3: what happens when the pool runs dry ----
+// vLLM has two ways to recover a preempted sequence: throw its KV cache away and recompute it
+// from prompt + what it had already emitted, or push its pages out to host RAM and pull them
+// back later. Both exist here; `recompute` is the default so every run taken before this was
+// written keeps its meaning. PREEMPTION_POLICY selects at startup.
+//
+// The host buffer is deliberately small. vLLM's default swap space is 4 GiB per GPU; this
+// machine has ~2.9 GiB of host RAM free in total, and loadWeights briefly holds 2.3 GiB of it,
+// so the buffer is claimed only after that has been released (see main.cu). 512 MiB is eight
+// full MAX_TOKENS_PER_SEQUENCE sequences' worth of pages - a sequence's KV cache is 64 MiB
+// whatever BLOCK_SIZE cuts it into - which is far deeper than the preemption depth measured
+// here, so the policy is never starved into falling back for lack of room.
+constexpr size_t SWAP_HOST_BYTES = 512ull * 1024 * 1024;

@@ -57,5 +57,8 @@ temp*.md
 
 .claude/
 CLAUDE.md
-results/
+# raw run data stays local; the finished write-up is published
+results/*
+!results/paper/
 workloads/
+__pycache__/

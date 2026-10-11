@@ -43,15 +43,36 @@ STALL_TIMEOUT_S = float(os.environ.get("STALL_TIMEOUT_S", "600"))
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine-dir", required=True, help="base or paged_attention")
-    ap.add_argument("--workload", default="sharegpt", choices=["alpaca", "sharegpt"])
+    # Derived from what prepare_workload actually built, not a hand-kept list: this argument has
+    # now twice rejected a workload that existed on disk (sharegpt_chat for §6.5, the translate
+    # pair for §6.4), each time hours into a sweep.
+    ap.add_argument("--workload", default="sharegpt",
+                    choices=sorted(os.path.splitext(f)[0]
+                                   for f in os.listdir(os.path.join(REPO_ROOT, "workloads"))
+                                   if f.endswith(".json")))
     ap.add_argument("--rate", type=float, required=True,
                     help="Poisson arrival rate in requests/second; 0 means all at once")
     ap.add_argument("--num-requests", type=int, default=200,
                     help="the paper runs 1-hour traces; see the convergence check below for "
                          "what we preserve instead")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--num-seqs", type=int, default=1,
+                    help="answers to ask for per prompt (§6.3 parallel sampling). 1 everywhere "
+                         "else; needs TEMPERATURE > 0 to produce anything but n copies of the "
+                         "same text")
+    ap.add_argument("--preemption-policy", choices=["recompute", "swap"], default="recompute",
+                    help="§7.3: what the paged engine does when the page pool runs dry - rebuild "
+                         "the evicted KV cache with one prefill pass, or park it in host RAM and "
+                         "copy it back. Ignored by the contiguous build, which never preempts.")
+    ap.add_argument("--shared-prefix-len", type=int, default=0,
+                    help="§6.4: how many leading tokens every prompt in this workload shares. "
+                         "-1 takes the measured value from the workload's meta. The paged engine "
+                         "reserves the whole-page part of it once; the baseline only records it.")
     ap.add_argument("--out", type=str, default=None)
     ap.add_argument("--label", type=str, default="")
+    ap.add_argument("--engine-log", type=str, default=None,
+                    help="write the engine's stderr here; discarded by default. An assert that "
+                         "aborts the engine is otherwise unrecoverable from the result file.")
     ap.add_argument("--max-wall", type=float, default=0,
                     help="abort the run after this many seconds (0 = no limit)")
     return ap.parse_args()
@@ -104,9 +125,15 @@ def main():
 
     env = dict(os.environ)
     env["IGNORE_EOS"] = "1"  # every request emits exactly its budget, in every variant
+    env["PREEMPTION_POLICY"] = args.preemption_policy
+    shared_prefix_len = args.shared_prefix_len
+    if shared_prefix_len < 0:
+        shared_prefix_len = int(workload_meta.get("shared_prefix_tokens") or 0)
+    env["SHARED_PREFIX_LEN"] = str(shared_prefix_len)
     engine = subprocess.Popen(
         [engine_path, MODEL_DIR], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env, cwd=engine_dir,
+        stderr=open(args.engine_log, "w") if args.engine_log else subprocess.DEVNULL,
+        text=True, bufsize=1, env=env, cwd=engine_dir,
     )
 
     stopped = threading.Lock()
@@ -165,21 +192,49 @@ def main():
                     continue
                 if kind == "preempted":
                     entry["preemptions"] += 1
+                elif kind == "swapped_in":
+                    # §7.3 swap policy: the sequence came back from host RAM with no prefill.
+                    entry["swap_ins"] += 1
                 elif kind == "prefill_stats":
-                    # a resumed sequence prefills again; the first one is the TTFT
-                    entry.setdefault("prefill_ms", data.get("time_ms"))
+                    # A resumed sequence prefills again; the first one is the TTFT. Everything
+                    # after it is recovery cost (§7.3): the engine threw away the sequence's
+                    # pages and is rebuilding them from prompt + what it had already emitted.
+                    # Splitting the two here is what makes "how much did preemption cost" a
+                    # measurable quantity rather than an inference from the preemption count.
+                    resumed = data.get("resumed_tokens") or 0
+                    if resumed:
+                        entry["recompute_ms"] += data.get("time_ms") or 0.0
+                        entry["recompute_tokens"] += resumed
+                    else:
+                        entry.setdefault("prefill_ms", data.get("time_ms"))
                 elif data.get("done"):
-                    if entry["t_done"] is None:
-                        entry["t_done"] = time.perf_counter()
-                        entry["engine_tokens"] = data.get("tokens", 0)
+                    entry["seqs_done"] += 1
+                    entry["engine_tokens"] += data.get("tokens", 0)
+                    if data.get("error") and not entry["error"]:
                         entry["error"] = data.get("error")
+                    if entry["t_done"] is None and entry["seqs_done"] >= entry["n_seqs"]:
+                        entry["t_done"] = time.perf_counter()
                         if submit_done.is_set() and all(r["t_done"] is not None for r in reqs.values()):
                             finished.set()
-                else:
+                elif "tok" in data:
+                    # Only a line that actually carries a token id counts as a token. This used
+                    # to be a bare `else`, which silently counted every message type the engine
+                    # learned to emit afterwards: the swap policy's "swapped_in" line made each
+                    # swapped request appear to emit one token more than its budget, and the run
+                    # failed the token invariant for a reason that was not in the engine at all.
                     entry["tokens"] += 1
                     # order-sensitive rolling hash of the generated ids: two builds that
-                    # agree on this produced the same text, not just the same token count
-                    entry["checksum"] = (entry["checksum"] * 1000003 + data.get("tok", 0)) & 0xFFFFFFFF
+                    # agree on this produced the same text, not just the same token count.
+                    # Hashed per sequence, because the n answers of one request interleave
+                    # arbitrarily in time and a single combined hash would depend on that
+                    # interleaving rather than on the text.
+                    seq = data.get("seq", 0)
+                    if 0 <= seq < len(entry["seq_checksums"]):
+                        entry["seq_checksums"][seq] = (
+                            (entry["seq_checksums"][seq] * 1000003 + data.get("tok", 0)) & 0xFFFFFFFF)
+                    entry["checksum"] = 0
+                    for c in entry["seq_checksums"]:
+                        entry["checksum"] = (entry["checksum"] * 1000003 + c) & 0xFFFFFFFF
                     if entry["t_first"] is None:
                         entry["t_first"] = time.perf_counter()
 
@@ -200,9 +255,16 @@ def main():
                 reqs[i] = {"id": i, "out_budget": spec["output_len"], "prompt_tokens": spec["prompt_len"],
                            "t_arrival": time.perf_counter(), "t_first": None, "t_done": None,
                            "tokens": 0, "engine_tokens": 0, "preemptions": 0, "error": None,
-                           "checksum": 0, "prefill_ms": None}
+                           "checksum": 0, "prefill_ms": None,
+                           "recompute_ms": 0.0, "recompute_tokens": 0, "swap_ins": 0,
+                           # §6.3: one request can be several sequences. It is finished when
+                           # the last of them is, and its checksum is per-sequence so that n
+                           # answers which happen to be identical are still visibly identical.
+                           "n_seqs": args.num_seqs, "seqs_done": 0,
+                           "seq_checksums": [0] * args.num_seqs}
             try:
-                engine.stdin.write(f"{i} {spec['output_len']} " + " ".join(map(str, spec["prompt"])) + "\n")
+                engine.stdin.write(f"{i} {spec['output_len']} {args.num_seqs} "
+                                   + " ".join(map(str, spec["prompt"])) + "\n")
                 engine.stdin.flush()
             except (BrokenPipeError, OSError):
                 break
@@ -246,7 +308,14 @@ def main():
     # The paper's y axis: seconds of end-to-end latency per output token. Dividing by the
     # output length is what makes requests of wildly different lengths comparable.
     def norm_of(r):
-        return (r["t_done"] - r["t_arrival"]) / max(1, r["tokens"])
+        # The paper's metric is end-to-end latency divided by "its output length". With one
+        # answer per request those are the same thing. With n, the denominator is the length of
+        # *one* answer, not the total: a request that asked four ways and waited four times as
+        # long really did get four times slower from where the user sits, and dividing by the
+        # total would hide exactly that. It also keeps an n=4 curve on the same axis as an n=1
+        # curve, which is the only reason to plot them together.
+        per_seq = max(1, r["tokens"] // max(1, r["n_seqs"]))
+        return (r["t_done"] - r["t_arrival"]) / per_seq
 
     records.sort(key=lambda r: r["t_arrival"])
     norm = [norm_of(r) for r in records]
@@ -264,7 +333,8 @@ def main():
 
     # Token accounting. These must hold at any concurrency, unlike the checksum, which only
     # matches across builds when they batch the same number of sequences - see CLAUDE.md.
-    budget_mismatch = [r["id"] for r in records if r["tokens"] != r["out_budget"]]
+    budget_mismatch = [r["id"] for r in records
+                       if r["tokens"] != r["out_budget"] * r["n_seqs"]]
     engine_mismatch = [r["id"] for r in records if r["engine_tokens"] != r["tokens"]]
 
     result = {
@@ -285,6 +355,24 @@ def main():
         "throughput_req_s": len(records) / wall if wall > 0 else 0.0,
         "output_tokens": out_tokens,
         "preemptions": sum(r["preemptions"] for r in reqs.values()),
+        # §7.3, the cost of recovery-by-recompute. Two parts, because preemption wastes work in
+        # two different currencies: GPU time spent prefilling the same positions a second time,
+        # and decode work thrown away (every token the sequence had already emitted has to be
+        # re-derived). Identically zero on the contiguous build, which never preempts.
+        "recompute_ms": sum(r["recompute_ms"] for r in reqs.values()),
+        "recompute_tokens": sum(r["recompute_tokens"] for r in reqs.values()),
+        # Cumulative engine counters, read off the final telemetry line rather than summed:
+        # every "step" line already carries the running total. Absent on older runs and on the
+        # contiguous build, hence the .get with a zero default.
+        "swap_outs": (steps[-1].get("swap_outs") if steps else 0) or 0,
+        "swap_ins": (steps[-1].get("swap_ins") if steps else 0) or 0,
+        "swap_fallbacks": (steps[-1].get("swap_fallbacks") if steps else 0) or 0,
+        "swap_mb": (steps[-1].get("swap_mb") if steps else 0.0) or 0.0,
+        "swap_ms": (steps[-1].get("swap_ms") if steps else 0.0) or 0.0,
+        "prefix_hits": (steps[-1].get("prefix_hits") if steps else 0) or 0,
+        "prefix_pinned_pages": (steps[-1].get("prefix_pinned_pages") if steps else 0) or 0,
+        "preemption_policy": args.preemption_policy,
+        "shared_prefix_len": shared_prefix_len,
         "running_mean": (sum(s["running"] for s in steps) / len(steps)) if steps else 0.0,
         "running_max": max((s["running"] for s in steps), default=0),
         "waiting_mean": (sum(s["waiting"] for s in steps) / len(steps)) if steps else 0.0,

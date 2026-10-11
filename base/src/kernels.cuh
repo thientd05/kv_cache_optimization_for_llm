@@ -131,3 +131,43 @@ __global__ void argmaxFinalizeKernel(const float *partial_values, const int *par
 // Records this step's sampled token in the owning slot's penalty mask row.
 __global__ void markSampledTokensKernel(const int *sampled_tokens, const int *row_slot_ids,
                                         int num_rows, unsigned char *penalty_mask);
+
+// ---- random sampling ----
+//
+// Greedy decoding cannot produce the §6.3 workloads: "n different answers to one prompt" is not
+// something a model that always takes the argmax can do. These three kernels are temperature
+// sampling over the full vocabulary, deliberately reusing the argmax chunk geometry so the two
+// decode paths share their shapes and their repetition penalty.
+//
+// Pass 1 is argmaxPartialKernel, unchanged - its per-chunk maxima are exactly what a stable
+// softmax needs. Then:
+//
+//   rowMaxKernel         <<<num_rows, ARGMAX_CHUNKS_PER_ROW>>>
+//       reduces those maxima to one per row.
+//   expSumPartialKernel  <<<dim3(ARGMAX_CHUNKS_PER_ROW, num_rows), ARGMAX_BLOCK_THREADS>>>
+//       per-chunk sum of exp((penalised_logit - row_max) / temperature).
+//   sampleFinalizeKernel <<<num_rows, ARGMAX_BLOCK_THREADS>>>
+//       inverse-CDF draw: walks the 128 chunk sums to find the chunk, then that chunk's ~1000
+//       tokens to find the token. Both walks are ordered prefix sums - a CDF needs order, so
+//       neither may be a strided reduction.
+//
+// Top-p is not implemented. Truncating the nucleus needs the row in sorted order, which here
+// means a sort or ~20 extra full-row passes per step, and it buys nothing: these experiments
+// need the sequences to diverge, not to match vLLM's exact sampler. Beam search does not sample.
+//
+// row_rng_keys/row_positions make the draw a pure function of (seed, sequence, position). A
+// stateful generator would make runs unreproducible and would hand a recomputed sequence a
+// different random stream than the one it was preempted from, breaking the token invariant.
+__global__ void rowMaxKernel(const float *partial_values, int num_rows, float *row_max);
+
+__global__ void expSumPartialKernel(const __nv_bfloat16 *logits, int num_rows,
+                                    const unsigned char *penalty_mask, const int *row_slot_ids,
+                                    const float *row_max, float inv_temperature,
+                                    float *partial_sums);
+
+__global__ void sampleFinalizeKernel(const __nv_bfloat16 *logits, int num_rows,
+                                     const unsigned char *penalty_mask, const int *row_slot_ids,
+                                     const float *row_max, const float *partial_sums,
+                                     float inv_temperature, unsigned int seed,
+                                     const int *row_rng_keys, const int *row_positions,
+                                     int *sampled_tokens);

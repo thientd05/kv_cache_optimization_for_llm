@@ -85,6 +85,11 @@ constexpr float REPETITION_PENALTY = 1.15f;
 // Worst-case lifetime footprint of one sequence, in tokens of context. Both builds need it: the
 // baseline reserves against it, the paged build sizes its block table by it.
 constexpr int MAX_TOKENS_PER_SEQUENCE = MAX_PROMPT_LEN + MAX_NEW_TOKENS_GENERATED;
+
+// §6.3 asks the engine for several answers to one prompt. The wire format carries the count,
+// so this is also a guard: the field used to be the first token id, and a client that was not
+// updated would otherwise ask for 128000 sequences and the engine would try.
+constexpr int MAX_PARALLEL_SEQUENCES = 8;
 static_assert(MAX_TOKENS_PER_SEQUENCE <= MAX_SEQ_LEN,
               "the RoPE tables only cover MAX_SEQ_LEN positions");
 
